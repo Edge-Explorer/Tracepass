@@ -7,38 +7,59 @@ import urllib.request
 
 COMMENT_MARKER = "<!-- tracepass-gemini-pr-summary -->"
 DEFAULT_MODEL = "gemini-2.5-flash"
-MAX_DIFF_CHARS = 35000  # Safeguard against huge diffs
+MAX_DIFF_CHARS = 50000
 
 
-def get_git_diff() -> str:
+def get_git_diff(base_ref: str) -> str:
     """Extract git diff for the pull request."""
     # Attempt to read from environment variable first
-    diff = os.environ.get("PR_DIFF", "")
+    diff = os.environ.get("PR_DIFF", "").strip()
     if diff:
         return diff
 
-    # Otherwise extract via git command comparing against origin/main or base ref
-    base_ref = os.environ.get("GITHUB_BASE_REF", "main")
     try:
-        subprocess.run(["git", "fetch", "origin", base_ref], check=False, capture_output=True)
+        subprocess.run(
+            ["git", "fetch", "origin", base_ref, "--depth=100"], check=False, capture_output=True
+        )
         res = subprocess.run(
             ["git", "diff", f"origin/{base_ref}...HEAD"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return res.stdout
+        if res.stdout.strip():
+            return res.stdout
     except Exception as e:
-        print(f"Warning: Failed to get diff via git command: {e}")
+        print(f"Warning: git diff command failed: {e}")
+
+    # Fallback to general git diff HEAD~1 if shallow clone
+    try:
+        res = subprocess.run(
+            ["git", "diff", "HEAD~1...HEAD"], capture_output=True, text=True, check=True
+        )
+        return res.stdout
+    except Exception:
         return ""
 
 
-def get_changed_files_list() -> list[str]:
+def get_changed_files_list(base_ref: str) -> list[str]:
     """Retrieve list of modified files."""
-    base_ref = os.environ.get("GITHUB_BASE_REF", "main")
     try:
         res = subprocess.run(
             ["git", "diff", "--name-status", f"origin/{base_ref}...HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        if lines:
+            return lines
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["git", "diff", "--name-status", "HEAD~1...HEAD"],
             capture_output=True,
             text=True,
             check=True,
@@ -49,14 +70,14 @@ def get_changed_files_list() -> list[str]:
 
 
 def generate_gemini_summary(api_key: str, model_name: str, prompt: str) -> str:
-    """Call Google Gemini API using urllib."""
+    """Call Google Gemini API using urllib with high token limit."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 8192,
         },
     }
 
@@ -68,7 +89,7 @@ def generate_gemini_summary(api_key: str, model_name: str, prompt: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=90) as response:
             result = json.loads(response.read().decode("utf-8"))
             candidates = result.get("candidates", [])
             if not candidates:
@@ -77,7 +98,6 @@ def generate_gemini_summary(api_key: str, model_name: str, prompt: str) -> str:
             return text
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
-        # Try fallback model if 2.5-flash is unavailable
         if model_name != "gemini-2.0-flash" and (
             "not found" in error_body.lower() or e.code == 404
         ):
@@ -100,10 +120,8 @@ def post_or_update_pr_comment(
         "User-Agent": "Tracepass-CI-Gemini-Bot",
     }
 
-    # Format body with marker
     full_comment = f"{COMMENT_MARKER}\n{comment_body}"
 
-    # Check if a comment with this marker already exists
     list_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     req = urllib.request.Request(list_url, headers=headers, method="GET")
 
@@ -144,33 +162,33 @@ def main():
     pr_number = os.environ.get("PR_NUMBER", "").strip()
     pr_title = os.environ.get("PR_TITLE", "No Title")
     pr_body = os.environ.get("PR_BODY", "No description provided.")
+    base_ref = os.environ.get("GITHUB_BASE_REF", "main").strip() or "main"
     model_name = os.environ.get("GEMINI_MODEL", DEFAULT_MODEL).strip()
 
     if not repo or not pr_number or not github_token:
-        print(
-            "Missing required GitHub environment variables (GITHUB_REPOSITORY, PR_NUMBER, GITHUB_TOKEN)."
-        )
+        print("Missing required GitHub environment variables.")
         sys.exit(1)
 
-    diff = get_git_diff()
-    file_list = get_changed_files_list()
+    diff = get_git_diff(base_ref)
+    file_list = get_changed_files_list(base_ref)
 
     truncated_note = ""
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + "\n\n...[Diff truncated due to size limits]..."
-        truncated_note = "\n*(Note: Diff was truncated due to character limits)*"
+        truncated_note = "\n*(Note: Large diff was truncated to fit context limits)*"
 
-    files_summary_text = "\n".join(file_list) if file_list else "Not available via git status"
+    files_summary_text = "\n".join(file_list) if file_list else "All files in PR diff"
 
-    prompt = f"""You are an expert senior code reviewer and software architect.
-Analyze the following Pull Request details and Git Diff for the repository '{repo}'.
+    prompt = f"""You are an elite principal software architect and code reviewer.
+Analyze the following Pull Request details, modified file list, and Git Diff for the repository '{repo}'.
 
-Generate a structured, clean, and comprehensive Pull Request Summary in Markdown.
+Your goal is to provide a DEEP, THOROUGH, and COMPREHENSIVE Pull Request review and file-by-file breakdown so that the reviewers understand every single nuance and change without having to open and read every file manually.
 
-### PR Information:
+### Pull Request Metadata:
 - **Title**: {pr_title}
 - **PR #**: {pr_number}
-- **Description**:
+- **Target Branch**: {base_ref}
+- **User Description**:
 {pr_body}
 
 ### Changed Files:
@@ -181,30 +199,43 @@ Generate a structured, clean, and comprehensive Pull Request Summary in Markdown
 {diff}
 ```
 
-### Please output your review strictly in this markdown format:
-## 🤖 Gemini 2.5 Flash Pull Request Summary
+---
 
-### ⚡ Executive Summary
-[A concise 2-3 sentence overview explaining what this PR accomplishes, why it was made, and the core outcome]
+### Format your response strictly following this structure:
 
-### 📂 File-by-File Changes & Impact
-| File | Action | Summary of Changes |
+# 🤖 PR Detailed Review & Summary by Gemini Code Intelligence
+
+## 1. Executive Summary (In Plain English)
+[Provide a clear, rich paragraph explaining the purpose, scope, and high-level architectural impact of this Pull Request.]
+
+## 2. Motivation & Root Cause Analysis
+[Explain what was missing, broken, or why this implementation was necessary. Break down specific shortcomings or objectives in numbered bullet points.]
+
+## 3. Step-by-Step Technical Solution
+[Detail the exact technical steps, tools, algorithms, and architectural mechanisms introduced or modified in this PR. Use numbered points with backticks for file names, symbols, and functions.]
+
+## 4. File-by-File Breakdown & Key Implementation Details
+[Provide a detailed markdown table covering EVERY single file touched in the diff. In the "Purpose & Key Implementation Details" column, write 2-4 comprehensive sentences explaining the exact classes, functions, configurations, or logic changes made in that file.]
+
+| File | Action | Purpose & Key Implementation Details |
 | :--- | :--- | :--- |
-| `path/to/file` | `Added` / `Modified` / `Deleted` | [One-sentence clear summary of what changed inside this file] |
+| `path/to/file` | `Added` / `Modified` / `Deleted` | **[Key component/function]**: [Deep explanation of the implementation details, parameters added, logic handled, or configs introduced] |
 
-### 🔍 Key Architectural & Logic Highlights
-- [Bullet points of significant algorithmic, structural, or configuration changes]
+## 5. Architecture, Reliability & Security Considerations
+- **Architecture & Maintainability**: [Analysis of design patterns, modularity, and integration]
+- **Security & Secrets**: [Validation of secret safety, inputs, and error handling]
+- **Performance**: [Runtime overhead, efficiency, or caching considerations]
 
-### ⚠️ Risk & Breaking Change Assessment
-- **Risk Level**: [🟢 Low / 🟡 Medium / 🔴 High]
-- **Details**: [Any potential side-effects, backward compatibility concerns, or missing edge case handling]
+## 6. Risk Assessment & Edge Cases
+- **Overall Risk Level**: [🟢 Low / 🟡 Medium / 🔴 High]
+- **Potential Edge Cases / Side Effects**: [List any potential breaking changes or scenarios to watch out for]
 
-### 🧪 Reviewer & Verification Checklist
-- [ ] [Verification point 1]
-- [ ] [Verification point 2]
+## 7. Reviewer & Testing Verification Checklist
+- [ ] [Specific verification action item for the reviewer]
+- [ ] [Specific test or validation scenario]
 """
 
-    print(f"Generating summary using model '{model_name}'...")
+    print(f"Generating comprehensive review using model '{model_name}'...")
     try:
         summary_md = generate_gemini_summary(api_key, model_name, prompt)
         if truncated_note:
