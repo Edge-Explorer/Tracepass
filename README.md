@@ -118,10 +118,10 @@ playwright install   # Required by Scrapling for JS-rendered pages
 
 ```python
 # config/settings.py
-LLM_PROVIDER = "openai"          # or "bedrock", "ollama"
-MODEL_NAME   = "gpt-4o"
-MAX_DEPTH    = 5                 # Max crawl depth before giving up
-OUTPUT_DIR   = "./outputs"
+LLM_PROVIDER = "openai"  # or "bedrock", "ollama"
+MODEL_NAME = "gpt-4o"
+MAX_DEPTH = 5  # Max crawl depth before giving up
+OUTPUT_DIR = "./outputs"
 ```
 
 ### 3. Run

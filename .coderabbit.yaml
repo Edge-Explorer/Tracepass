@@ -1,0 +1,34 @@
+﻿# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+tone_instructions: "Be precise, concise, and helpful. Focus on code quality, security, and best practices for Python and web scraping agent architecture."
+early_access: false
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+      - "master"
+  tools:
+    ruff:
+      enabled: true
+    github-checks:
+      enabled: true
+chat:
+  auto_reply: true
+path_filters:
+  - "!**/*.lock"
+  - "!**/uv.lock"
+  - "!**/dist/**"
+  - "!**/build/**"
+  - "!**/outputs/**"
+  - "!**/downloads/**"
+  - "!**/data/**"
+  - "!**/*.pyc"
+  - "!**/__pycache__/**"
