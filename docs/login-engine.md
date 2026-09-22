@@ -275,17 +275,17 @@ Playwright's `BrowserContext.storage_state()` method natively exports a JSON fil
 
 For single-page applications (SPAs) that store authentication tokens in `sessionStorage`, Playwright's `storage_state()` does not capture `sessionStorage` natively. Tracepass extends session persistence by executing a custom helper (`page.evaluate("() => JSON.stringify(sessionStorage)")`) during session save, and re-injecting those entries during context restoration.
 
-This file is stored at: `~/.tracepass/sessions/<domain_hash>.json`
+This file is stored at: `~/.tracepass/sessions/<sha256_of_domain>.json`
 
-The domain hash is a SHA-256 hash of the normalized domain (scheme + host) to avoid filename conflicts and to prevent casual readability of which accounts are stored.
+The SHA-256 hash is derived from the normalized domain (scheme + host) to avoid filename conflicts and to prevent casual readability of which accounts are stored.
 
 
 ### 5.2 Session Validity Check
 
 Before attempting any login, the Session Cache Checker:
 
-1. Derives the domain hash from the target URL.
-2. Checks if `.sessions/<domain_hash>.json` exists.
+1. Derives the SHA-256 hash from the target URL's normalized domain.
+2. Checks if `~/.tracepass/sessions/<sha256_of_domain>.json` exists.
 3. If it exists, loads it into a new Playwright `BrowserContext`.
 4. Navigates to a known authenticated URL on the domain (e.g., the user profile page or dashboard).
 5. Checks whether the page redirects to a login page or an authenticated state.
