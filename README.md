@@ -362,9 +362,9 @@ ruff>=0.9.0
 
 ## Authentication and Login Engine
 
-Tracepass includes a fully autonomous Login Engine capable of handling any type of website authentication without manual intervention. It is designed to be the foundation for all scraping tasks that require an authenticated session.
+Tracepass is being built with a Login Engine designed to handle the full range of website authentication patterns without manual intervention for v1 supported flows. The following capabilities are planned for v1 and are currently in active design. Flows that require human involvement (2FA, CAPTCHA, new device verification) are handled via interactive prompts or plugin interfaces, not silently skipped.
 
-### Supported Login Flow Types
+### Planned Supported Login Flow Types (v1)
 
 | Type | Description | Examples |
 | :--- | :--- | :--- |
@@ -375,21 +375,22 @@ Tracepass includes a fully autonomous Login Engine capable of handling any type 
 | OAuth / SSO | Delegation to a third-party identity provider | "Continue with Google / GitHub" |
 | API-Based (SPA) | JavaScript-driven form with no traditional `<form>` | Most modern React/Vue applications |
 
-### Key Capabilities
+### Planned Key Capabilities (v1)
 
 - **Semantic field detection** — identifies username, password, submit, and next-step fields using attribute patterns, ARIA labels, and placeholder text rather than hardcoded CSS selectors. Works on any site without prior configuration.
 - **Human-realistic input timing** — randomized inter-keystroke delays and simulated mouse paths to avoid bot-detection systems that measure interaction patterns.
-- **Session persistence** — after a successful login, the full browser session (cookies, `localStorage`, `sessionStorage`) is saved to `~/.tracepass/sessions/`. Subsequent requests to the same domain skip the login entirely.
-- **Secure credential storage** — credentials are stored in the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service) with an AES-256 encrypted file as fallback for headless environments.
+- **Session persistence** (planned) — after a successful login, cookies and `localStorage` are saved to `~/.tracepass/sessions/` with owner-only file permissions. Re-authentication for the same domain will be skipped on subsequent runs. Session cleanup, expiry, and revocation lifecycle are defined in the design document.
+- **Secure credential storage** — credentials are stored in the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service) with an AES-256-GCM encrypted file as fallback for headless environments. Credentials are never written to plaintext files or passed to the LLM.
 - **Failure-aware retry policy** — each failure type (`CredentialRejected`, `PageLoadTimeout`, `AccountLocked`, `CaptchaRequired`, etc.) has a specific retry or abort behavior to protect against account lockouts.
 - **CAPTCHA solver integration** — opt-in support for 2captcha and anticaptcha solver APIs, activated by setting `CAPTCHA_SOLVER_API_KEY` in `.env`.
-- **2FA / OTP support** — blocks on a terminal prompt for TOTP and SMS codes, with an environment variable bypass (`TRACEPASS_OTP_<DOMAIN>=<code>`) for headless CI environments.
+- **2FA / OTP support** — blocks on a terminal prompt for TOTP and SMS codes. For headless CI environments, a shell-safe environment variable `TRACEPASS_OTP_<SAFE_DOMAIN>=<code>` can be pre-set (domain normalized to uppercase with dots and dashes replaced by underscores, e.g., `TRACEPASS_OTP_EXAMPLE_COM=123456`).
 
 ### What is Out of Scope
 
 First-time account registration and sign-up flows are not supported in v1. The Login Engine requires an existing account. If no credentials or session are found for a domain, the engine surfaces a clear error directing the user to create an account manually and provide credentials.
 
 For the complete design specification, architecture diagrams, edge case analysis, worst-case scenarios, complexity analysis, and implementation checklist, see [docs/login-engine.md](./docs/login-engine.md).
+
 
 ---
 

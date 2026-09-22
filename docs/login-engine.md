@@ -2,7 +2,7 @@
 
 ## Document Purpose
 
-This document is the authoritative technical design specification for the **Autonomous Login Engine** in Tracepass. It defines the architecture, all known login flow patterns, credential management strategy, session lifecycle, edge case handling, worst-case scenarios, and time and space complexity analysis. The goal is to ensure that any type of login page — regardless of its structure, security layer, or authentication mechanism — can be handled completely autonomously without manual intervention.
+This document is the authoritative technical design specification for the **Autonomous Login Engine** in Tracepass. It defines the architecture, supported v1 login flow patterns (Types 1–6), credential management strategy, session lifecycle, edge case handling, worst-case scenarios, and time and space complexity analysis. The goal is to ensure that supported login pages are handled autonomously, while out-of-scope or anti-bot protected flows (Type 7 registration, CAPTCHAs, 2FA/OTP, email verification) are handled via explicit plugin interfaces, interactive prompts, or graceful error boundaries.
 
 ---
 
@@ -18,7 +18,8 @@ This document is the authoritative technical design specification for the **Auto
 8. [Edge Cases and Failure Modes](#8-edge-cases-and-failure-modes)
 9. [Worst-Case Scenarios](#9-worst-case-scenarios)
 10. [Time and Space Complexity Analysis](#10-time-and-space-complexity-analysis)
-11. [Open Design Questions](#11-open-design-questions)
+11. [Design Decisions](#11-design-decisions)
+12. [Implementation Checklist](#12-implementation-checklist)
 
 ---
 
@@ -32,15 +33,16 @@ Web scraping tasks often require the agent to be in an authenticated state befor
 - Authentication protocol (native forms, OAuth 2.0, SSO federation)
 - Session persistence strategy (cookie-based, JWT in `localStorage`, server-side sessions)
 
-A human navigates all of these intuitively. The Tracepass Login Engine must replicate this intuition through a combination of semantic DOM analysis, stateful multi-turn execution, and intelligent session reuse.
+A human navigates all of these intuitively. The Tracepass Login Engine replicates this intuition through a combination of semantic DOM analysis, stateful multi-turn execution, and intelligent session reuse.
 
-**Core requirement**: Given a target URL and a set of credentials, the agent must:
+**Core requirement**: Given a target URL and a set of credentials for supported v1 login flows (Types 1–6), the agent must:
 
 1. Detect the type of login flow present on the page.
 2. Execute the login sequence correctly, handling intermediate DOM states.
 3. Verify that authentication succeeded.
 4. Persist the authenticated session so future requests to the same domain do not repeat the login.
-5. Gracefully handle all failure modes without crashing the broader scraping task.
+5. Gracefully handle out-of-scope flows (Type 7 registration, CAPTCHA, 2FA) via plugins, interactive prompts, or clear error boundaries without crashing the broader scraping pipeline.
+
 
 ---
 
@@ -220,21 +222,21 @@ The Login Engine is structured as a pipeline of 5 components that execute in seq
 
 ### 4.1 How Credentials Are Provided
 
-Credentials must never be embedded in code or passed through the LLM prompt directly (the LLM backend is a third-party service and prompts may be logged). Two supported modes:
+Credentials must never be embedded in source code or passed through LLM API prompts (the LLM backend is a third-party service and prompts may be logged). Two supported modes:
 
-**Mode A: Environment Variables (Recommended for automation)**
+**Mode A: Process-Injected Environment Variables (Recommended for automation)**
 
-Credentials are stored in `.env` using a structured format keyed by domain:
+Credentials are supplied to process memory via the `TRACEPASS_CREDS` environment variable (loaded from `.env` via `python-dotenv` or injected by CI secrets managers) using a structured JSON map keyed by domain:
 
 ```env
 TRACEPASS_CREDS={"example.com": {"username": "user@email.com", "password": "secret"}, "anothersite.com": {"username": "user2", "password": "pass2"}}
 ```
 
-The Credential Resolver parses this JSON map and looks up the domain of the target URL.
+The Credential Resolver parses this JSON map in memory and looks up the domain of the target URL. Plaintext credential files are prohibited on disk.
 
 **Mode B: Interactive Prompt (Recommended for manual/first-time runs)**
 
-If no credentials exist in the environment for a domain, the agent pauses and prompts the user:
+If no credentials exist in process memory for a domain, the agent pauses and prompts the user in the terminal:
 
 ```
 [Tracepass] Authentication required for: example.com
@@ -243,7 +245,7 @@ Enter password (hidden): _
 Save credentials for future runs? [y/N]: _
 ```
 
-If the user chooses to save, credentials are encrypted and written to `~/.tracepass/credentials.json` using the operating system's keyring via the `keyring` library.
+If the user chooses to save, credentials are saved securely to the **OS Keyring** via the `keyring` library (Windows Credential Manager, macOS Keychain, Linux Secret Service). In headless or containerized environments where no OS keyring is available, credentials are saved to `~/.tracepass/credentials.enc` encrypted with AES-256-GCM using a PBKDF2-derived key (see Decision 4).
 
 **Mode C: Credential Vault Integration (Future)**
 
@@ -253,12 +255,12 @@ Integration with HashiCorp Vault, AWS Secrets Manager, or similar enterprise sec
 
 - Credentials are **never** included in Gemini/LLM API prompts.
 - Credentials are **never** written to logfiles.
-- Credentials are **never** stored in plaintext on disk (only via OS keyring or encrypted vault).
-- The LLM is given access to credential values at the executor layer only, as runtime parameters injected directly into Playwright's `fill()` calls.
+- Credentials are **never** stored in plaintext on disk (only process-injected in memory, or stored via OS keyring / AES-256 encrypted file).
+- The LLM **never** sees raw credential strings. The LLM receives only DOM structure and returns abstract selector intent (e.g., `fill(username_field)`). The Python execution layer resolves the credentials from memory/keyring and injects them directly into Playwright's `fill()` call.
 
 ### 4.3 Credential Passing Between Sessions
 
-Within a single Tracepass run, once login succeeds, the credential values are held in memory only (as a `LoginContext` dataclass). They are discarded at the end of the process. The session cookie / `storage_state.json` is what persists to disk, not the raw credentials.
+Within a single Tracepass run, once login succeeds, credential values exist only in process memory (as a `LoginContext` dataclass). They are discarded when the process terminates. The session cookie / `storage_state.json` is what persists to disk, not the raw credentials.
 
 ---
 
@@ -266,15 +268,17 @@ Within a single Tracepass run, once login succeeds, the credential values are he
 
 ### 5.1 Session Storage Format
 
-Playwright's `BrowserContext.storage_state()` method exports a JSON file containing:
+Playwright's `BrowserContext.storage_state()` method natively exports a JSON file containing:
 
 - All cookies (domain, path, value, expiry, secure, httpOnly flags).
 - `localStorage` entries per origin.
-- `sessionStorage` entries per origin.
 
-This file is stored at: `.sessions/<domain_hash>.json`
+For single-page applications (SPAs) that store authentication tokens in `sessionStorage`, Playwright's `storage_state()` does not capture `sessionStorage` natively. Tracepass extends session persistence by executing a custom helper (`page.evaluate("() => JSON.stringify(sessionStorage)")`) during session save, and re-injecting those entries during context restoration.
+
+This file is stored at: `~/.tracepass/sessions/<domain_hash>.json`
 
 The domain hash is a SHA-256 hash of the normalized domain (scheme + host) to avoid filename conflicts and to prevent casual readability of which accounts are stored.
+
 
 ### 5.2 Session Validity Check
 
@@ -367,13 +371,14 @@ This is a direct use of Scrapling's stealth capabilities combined with Playwrigh
 1.  Navigate to login URL.
 2.  Detect only email/username input is visible.
 3.  Fill email input with human-realistic timing.
-4.  Locate and click the "Next" button.
-5.  Wait for one of:
-      a. A new URL is loaded (page.wait_for_navigation())
-      b. password input appears in the DOM (page.wait_for_selector("input[type=password]"))
-    Timeout: 10 seconds. On timeout: raise MultiStepTransitionTimeout.
-6.  Fill password input.
-7.  Click submit.
+4.  Arm navigation/DOM waiters BEFORE triggering the click (prevents race conditions):
+      async with page.expect_navigation() (or page.expect_selector("input[type=password]")):
+          await next_button.click()
+5.  Timeout: 10 seconds. On timeout: raise MultiStepTransitionTimeout.
+6.  Fill password input with human-realistic timing.
+7.  Arm navigation waiter BEFORE clicking submit:
+      async with page.expect_navigation():
+          await submit_button.click()
 8.  Wait for navigation or authenticated DOM state.
 9.  Proceed to Verification.
 ```
@@ -398,15 +403,18 @@ This is a direct use of Scrapling's stealth capabilities combined with Playwrigh
 ```
 1.  Navigate to page URL.
 2.  Detect SSO provider buttons.
-3.  Record current number of open browser pages.
-4.  Click SSO button.
-5.  Detect result:
-      a. Same-tab redirect: page.wait_for_navigation() — follow the redirect.
-      b. New popup: page.context.wait_for_event("page") — get new page handle.
-6.  On the identity provider's login page, execute standard login (Type 1 or Type 2).
-7.  Wait for redirect back to original domain.
-8.  Close popup handle if applicable.
-9.  Proceed to Verification.
+3.  Arm event waiters BEFORE clicking (prevents popup/redirect race conditions):
+      a. For same-tab redirect:
+         async with page.expect_navigation():
+             await sso_button.click()
+      b. For popup window:
+         async with page.context.expect_event("page") as popup_info:
+             await sso_button.click()
+         popup_page = await popup_info.value
+4.  On the identity provider's login page, execute standard login flow.
+5.  Wait for redirect back to original domain.
+6.  Close popup handle if applicable.
+7.  Proceed to Verification.
 ```
 
 ---
@@ -421,7 +429,7 @@ This is a direct use of Scrapling's stealth capabilities combined with Playwrigh
 | **SMS OTP Verification** | "Enter the code sent to your phone" message in DOM | Pause; surface `SMSOTPRequired`; resume when user provides code |
 | **Email Verification Required** | "Check your email" or redirect to email-confirm screen | Surface `EmailVerificationRequired: Check inbox for link`; cannot proceed autonomously |
 | **Account Locked / Rate Limited** | "Too many attempts" message in DOM | Surface `AccountLocked` error with cooldown message; halt retries immediately |
-| **Wrong Credentials** | Error message in DOM after submit (regex: `/(incorrect|invalid|wrong|failed)/i`) | Surface `CredentialRejected` error; do not retry automatically (risk of account lockout) |
+| **Wrong Credentials** | Error message in DOM after submit (regex: `/(incorrect&#124;invalid&#124;wrong&#124;failed)/i`) | Surface `CredentialRejected` error; do not retry automatically (risk of account lockout) |
 | **Login Success but No Redirect** | Page state does not change after submit (SPA auth via XHR) | Wait for `localStorage` or cookie mutation indicating token storage; verify via session check |
 | **Password Expired** | "Your password has expired, please reset" screen | Surface `PasswordExpired` error; cannot proceed autonomously |
 | **Device Trust / New Device Verification** | "We don't recognize this device" screen | Surface `DeviceTrustRequired` error; inform user out-of-band verification is needed |
@@ -432,6 +440,7 @@ This is a direct use of Scrapling's stealth capabilities combined with Playwrigh
 | **JavaScript Disabled Detection** | Site shows "Please enable JavaScript" | This should not occur as Scrapling uses a full Playwright browser; log as unexpected error |
 | **Infinite Redirect Loop** | Navigation depth exceeds 10 redirects | Raise `NavigationLoopDetected`; abort |
 | **Slow Network / Timeout** | Any wait exceeds configured timeout | Raise `PageLoadTimeout`; retry once; then abort |
+
 
 ---
 
@@ -560,7 +569,10 @@ The following decisions have been finalized by the Tracepass team. These are bin
   [Tracepass] Enter the 6-digit TOTP or SMS code: _
   ```
 - Timeout: if no code is entered within 120 seconds, raises `TwoFactorTimeout` and aborts.
-- For headless and CI environments, a `TRACEPASS_OTP_<DOMAIN>=<code>` environment variable can be pre-set to bypass the interactive prompt entirely.
+- For headless and CI environments, a shell-safe environment variable `TRACEPASS_OTP_<SAFE_DOMAIN>` can be pre-set to bypass the interactive prompt entirely.
+- **Shell-Safe Domain Normalization**: Non-alphanumeric characters (such as `.` or `-`) in the hostname are replaced with underscores `_` and converted to uppercase.
+  - Example for `example.com`: `TRACEPASS_OTP_EXAMPLE_COM=123456`
+  - Example for `sub.site-app.org`: `TRACEPASS_OTP_SUB_SITE_APP_ORG=654321`
 
 ---
 
@@ -580,15 +592,33 @@ The following decisions have been finalized by the Tracepass team. These are bin
 
 ### Decision 4: Credential Storage
 
-**Decision**: **OS keyring as primary**, with an **AES-256 encrypted JSON file as fallback** for headless or Docker environments where the OS keyring is unavailable.
+**Decision**: **OS keyring as primary**, with an **AES-256-GCM encrypted JSON file as fallback** for headless or Docker environments where the OS keyring is unavailable.
 
 **Rationale**: The OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service) is the most secure option — credentials are OS-encrypted and tied to the user account, never written to disk in plaintext. The encrypted file fallback ensures the engine works in CI and containerized environments where no keyring daemon is running.
 
 **Implementation**:
 - Primary: `keyring.set_password("tracepass", domain, json.dumps(creds))`.
 - Fallback detection: if `keyring.get_keyring()` returns `keyring.backends.fail.Keyring`, switch to encrypted file.
-- Fallback file: `~/.tracepass/credentials.enc` — AES-256-GCM encrypted with a key derived via PBKDF2 from a user-provided master password held in memory only.
+- Fallback file: `~/.tracepass/credentials.enc`.
 - Credentials are **never** logged, passed to the LLM, or written to plaintext files under any circumstances.
+
+**AES-256-GCM Fallback File Format Specification (`~/.tracepass/credentials.enc`)**:
+To ensure deterministic key derivation, security against replay attacks, and cross-platform compatibility:
+- **Format Version**: `1` (integer)
+- **Key Derivation**: PBKDF2-HMAC-SHA-256 with 600,000 iterations and a fresh random 16-byte (128-bit) salt per file write.
+- **Encryption**: AES-256-GCM with a fresh random 12-byte (96-bit) nonce per file write and a 16-byte (128-bit) GCM authentication tag.
+- **Record Structure (JSON)**:
+  ```json
+  {
+    "version": 1,
+    "salt": "<32-character hex-encoded string (16 bytes)>",
+    "nonce": "<24-character hex-encoded string (12 bytes)>",
+    "tag": "<32-character hex-encoded string (16 bytes)>",
+    "ciphertext": "<hex-encoded AES-256-GCM encrypted payload>"
+  }
+  ```
+- **Validation**: Decryption readers must verify `version == 1`, enforce exact byte lengths for salt (16B), nonce (12B), and tag (16B), and verify the GCM tag before processing payload.
+
 
 ---
 
@@ -641,8 +671,8 @@ Track progress here as work begins. Mark each item when the corresponding code i
 ### Core Pipeline
 - [ ] `core/login_engine.py` — main orchestrator implementing the 5-component pipeline
 - [ ] `core/session_manager.py` — session read, write, validate, and invalidate
-- [ ] `core/credential_manager.py` — OS keyring + AES-256 encrypted file fallback
-- [ ] `core/field_detector.py` — semantic DOM analysis for all 5 field types
+- [ ] `core/credential_manager.py` — OS keyring + AES-256-GCM encrypted file fallback
+- [ ] `core/field_detector.py` — semantic DOM analysis for all 5 field types (username, password, submit, next-button, modal-trigger)
 - [ ] `core/login_executor.py` — stealth execution dispatcher per login flow type
 
 ### Login Flow Handlers
@@ -654,14 +684,14 @@ Track progress here as work begins. Mark each item when the corresponding code i
 
 ### Supporting Infrastructure
 - [ ] `core/captcha_solver.py` — opt-in CAPTCHA solver plugin (2captcha, anticaptcha backends)
-- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<DOMAIN>` env bypass
+- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<SAFE_DOMAIN>` env bypass (domain normalized to uppercase with dots/dashes replaced by underscores)
 - [ ] `core/retry_policy.py` — failure-type-specific retry logic table
 
 ### Tests
 - [ ] `tests/test_session_manager.py` — session read, write, expiry, and invalidation
-- [ ] `tests/test_field_detector.py` — unit tests against static HTML fixtures for all 6 field types
+- [ ] `tests/test_field_detector.py` — unit tests against static HTML fixtures for all 5 field types (username, password, submit, next-button, modal-trigger)
 - [ ] `tests/test_retry_policy.py` — unit test for each failure type's retry behavior
-- [ ] `tests/test_credential_manager.py` — keyring and encrypted file fallback behavior
+- [ ] `tests/test_credential_manager.py` — keyring and AES-256-GCM encrypted file fallback behavior
 - [ ] `tests/integration/test_single_step_login.py` — integration test against local mock login server
 - [ ] `tests/integration/test_multi_step_login.py` — integration test for multi-step flow
 
