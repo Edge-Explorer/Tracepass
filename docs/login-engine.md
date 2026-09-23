@@ -794,7 +794,7 @@ Track progress here as work begins. Mark each item when the corresponding code i
 - [ ] **IndexedDB research**: Point `StealthyFetcher` at a Firebase-Auth-backed SPA. Verify whether the saved session survives context recreation. Document the result in Section 5 of this doc before proceeding.
 
 ### Step 2: Field Detection Module
-- [ ] `core/field_detector.py` — honeypot pre-filter + two-mode detection (adaptive for known domains, discovery waterfall for unknown domains). Covers all 5 field types: username, password, submit, next-button, modal-trigger.
+- [ ] `core/field_detector.py` — honeypot pre-filter + two-mode detection (adaptive for known domains, discovery waterfall for unknown domains). Covers all 5 field types (username, password, submit, next-button, modal-trigger).
 - [ ] `tests/test_field_detector.py` — unit tests against static HTML fixtures for all 5 field types including honeypot cases.
 
 ### Step 3: Adaptive Durability Proof
@@ -816,7 +816,7 @@ Track progress here as work begins. Mark each item when the corresponding code i
 ### Step 7: Credential Management and Plugin Interfaces
 - [ ] `core/credential_manager.py` — OS keyring (primary) + AES-256-GCM encrypted file fallback with full file format spec from Decision 4.
 - [ ] `core/captcha_solver.py` — opt-in CAPTCHA solver plugin (2captcha, anticaptcha backends).
-- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<SAFE_DOMAIN>` env bypass.
+- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<SAFE_DOMAIN>` env bypass (domain normalized to uppercase, dots and dashes replaced by underscores, e.g. `TRACEPASS_OTP_EXAMPLE_COM`).
 - [ ] `core/retry_policy.py` — failure-type-specific retry logic table.
 - [ ] `tests/test_credential_manager.py` — keyring and AES-256-GCM encrypted file fallback behavior.
 - [ ] `tests/test_retry_policy.py` — unit test for each failure type's retry behavior.
