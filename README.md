@@ -1,4 +1,4 @@
-﻿# Tracepass
+# Tracepass
 
 **Autonomous Web Scraping and Media Extraction Framework**
 
@@ -16,9 +16,11 @@ Tracepass is a hierarchical, multi-agent framework for intelligent, fingerprint-
 - [Configuration](#configuration)
 - [Usage Examples](#usage-examples)
 - [Why Scrapling](#why-scrapling)
+- [Authentication and Login Engine](#authentication-and-login-engine)
 - [CI/CD Pipeline](#cicd-pipeline)
 - [Development Setup](#development-setup)
 - [Requirements](#requirements)
+- [Design Documentation](#design-documentation)
 - [Roadmap](#roadmap)
 - [Legal and Ethical Notice](#legal-and-ethical-notice)
 - [Contributing](#contributing)
@@ -355,6 +357,52 @@ Development dependencies:
 pytest>=8.0.0
 ruff>=0.9.0
 ```
+
+---
+
+## Authentication and Login Engine
+
+Tracepass is being built with a Login Engine designed to handle the full range of website authentication patterns without manual intervention for v1 supported flows. The following capabilities are planned for v1 and are currently in active design. Flows that require human involvement (2FA, CAPTCHA, new device verification) are handled via interactive prompts or plugin interfaces, not silently skipped.
+
+### Planned Supported Login Flow Types (v1)
+
+| Type | Description | Examples |
+| :--- | :--- | :--- |
+| Standard Single-Step | All fields visible simultaneously on page load | Reddit, Stack Overflow |
+| Multi-Step / Split | Email on step 1, password revealed on step 2 | Google, Microsoft, LinkedIn |
+| Modal and Overlay | Login form triggered by a button, rendered in a popup | Twitter/X, Medium |
+| iFrame and Shadow DOM | Inputs embedded in cross-origin frames | Enterprise SSO portals |
+| OAuth / SSO | Delegation to a third-party identity provider | "Continue with Google / GitHub" |
+| API-Based (SPA) | JavaScript-driven form with no traditional `<form>` | Most modern React/Vue applications |
+
+### Planned Key Capabilities (v1)
+
+- **Semantic field detection** — identifies username, password, submit, and next-step fields using attribute patterns, ARIA labels, and placeholder text rather than hardcoded CSS selectors. Works on any site without prior configuration.
+- **Human-realistic input timing** — randomized inter-keystroke delays and simulated mouse paths to avoid bot-detection systems that measure interaction patterns.
+- **Session persistence** (planned) — after a successful login, cookies and `localStorage` are saved to `~/.tracepass/sessions/` with owner-only file permissions. Re-authentication for the same domain will be skipped on subsequent runs. Session cleanup, expiry, and revocation lifecycle are defined in the design document.
+- **Secure credential storage** — credentials are stored in the OS keyring (Windows Credential Manager, macOS Keychain, Linux Secret Service) with an AES-256-GCM encrypted file as fallback for headless environments. Credentials are never written to plaintext files or passed to the LLM.
+- **Failure-aware retry policy** — each failure type (`CredentialRejected`, `PageLoadTimeout`, `AccountLocked`, `CaptchaRequired`, etc.) has a specific retry or abort behavior to protect against account lockouts.
+- **CAPTCHA solver integration** — opt-in support for 2captcha and anticaptcha solver APIs, activated by setting `CAPTCHA_SOLVER_API_KEY` in `.env`.
+- **2FA / OTP support** — blocks on a terminal prompt for TOTP and SMS codes. For headless CI environments, a shell-safe environment variable `TRACEPASS_OTP_<SAFE_DOMAIN>=<code>` can be pre-set (domain normalized to uppercase with dots and dashes replaced by underscores, e.g., `TRACEPASS_OTP_EXAMPLE_COM=123456`).
+
+### What is Out of Scope
+
+First-time account registration and sign-up flows are not supported in v1. The Login Engine requires an existing account. If no credentials or session are found for a domain, the engine surfaces a clear error directing the user to create an account manually and provide credentials.
+
+For the complete design specification, architecture diagrams, edge case analysis, worst-case scenarios, complexity analysis, and implementation checklist, see [docs/login-engine.md](./docs/login-engine.md).
+
+
+---
+
+## Design Documentation
+
+All major architectural components of Tracepass have dedicated design documents in the `docs/` directory. These documents serve as the authoritative reference for implementation decisions, edge case handling, and team alignment before coding begins.
+
+| Document | Component | Status |
+| :--- | :--- | :--- |
+| [docs/login-engine.md](./docs/login-engine.md) | Autonomous Login Engine — authentication, session management, credential storage | In Progress |
+
+Design documents follow a standard structure covering: problem statement, architecture, execution strategy, edge cases, worst-case scenarios, time and space complexity, finalized design decisions, and an implementation checklist. Contributors working on a new component are expected to produce a design document and have it reviewed before writing any implementation code.
 
 ---
 
