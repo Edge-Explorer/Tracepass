@@ -481,9 +481,8 @@ async def multi_step_page_action(page):
     await next_button.click()
 
     done, pending = await asyncio.wait(
-        [asyncio.ensure_future(nav_waiter),
-         asyncio.ensure_future(selector_waiter)],
-        return_when=asyncio.FIRST_COMPLETED
+        [asyncio.ensure_future(nav_waiter), asyncio.ensure_future(selector_waiter)],
+        return_when=asyncio.FIRST_COMPLETED,
     )
     for task in pending:
         task.cancel()  # Cancel the waiter that didn't fire
