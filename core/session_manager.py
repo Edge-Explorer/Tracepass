@@ -2,7 +2,7 @@
 
 Implements Section 5 & Decision 3 of docs/login-engine.md:
 - Persists session state to ~/.tracepass/sessions/<sha256_of_domain>.json.
-- Restricts file permissions (chmod 600 / owner read-write only).
+- Restricts file permissions (chmod 600 / owner read-write only on POSIX and restricted ACL on Windows).
 - Captures cookies, localStorage, and sessionStorage.
 - Provides session validation, loading, saving, and invalidation.
 """
@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -38,28 +39,50 @@ class SessionManager:
         if os.name != "nt":  # POSIX systems
             with contextlib.suppress(OSError):
                 os.chmod(self.storage_dir, 0o700)
+        else:
+            # Enforce restricted Windows ACL: remove inheritance and grant current user full control
+            with contextlib.suppress(Exception):
+                username = os.environ.get("USERNAME", "")
+                if username:
+                    subprocess.run(
+                        [
+                            "icacls",
+                            str(self.storage_dir),
+                            "/inheritance:r",
+                            "/grant:r",
+                            f"{username}:(OI)(CI)F",
+                        ],
+                        check=False,
+                        capture_output=True,
+                    )
 
     @classmethod
-    def normalize_domain(cls, domain_or_url: str) -> str:
-        """Normalizes a URL or domain string into a standard lowercase hostname.
+    def normalize_origin(cls, domain_or_url: str) -> str:
+        """Normalizes a URL or domain string into a standard scheme + host[:port] origin.
 
-        Uses scheme + host parsing (e.g. 'https://sub.Example.com:443/login' -> 'sub.example.com').
+        Distinguishes http vs https and port numbers (e.g. 'http://example.com:8080' vs 'https://example.com').
         """
         raw = domain_or_url.strip()
         if "://" not in raw:
             raw = f"https://{raw}"
         parsed = urlparse(raw)
-        hostname = (parsed.hostname or parsed.netloc).lower()
-        return hostname
+        scheme = (parsed.scheme or "https").lower()
+        netloc = (parsed.netloc or parsed.path).lower()
+        return f"{scheme}://{netloc}"
+
+    @classmethod
+    def normalize_domain(cls, domain_or_url: str) -> str:
+        """Backward-compatible alias for origin normalization."""
+        return cls.normalize_origin(domain_or_url)
 
     def get_session_path(self, domain_or_url: str) -> Path:
-        """Computes ~/.tracepass/sessions/<sha256_of_domain>.json for a domain."""
-        normalized = self.normalize_domain(domain_or_url)
-        domain_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        return self.storage_dir / f"{domain_hash}.json"
+        """Computes ~/.tracepass/sessions/<sha256_of_domain>.json for a domain or origin."""
+        normalized = self.normalize_origin(domain_or_url)
+        origin_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return self.storage_dir / f"{origin_hash}.json"
 
     def has_valid_session(self, domain_or_url: str, max_age_seconds: int = 86400 * 7) -> bool:
-        """Checks if an unexpired session file exists for the specified domain."""
+        """Checks if an unexpired session file exists with valid cookies or storage state."""
         session_path = self.get_session_path(domain_or_url)
         if not session_path.is_file():
             return False
@@ -71,8 +94,11 @@ class SessionManager:
             if time.time() - created_at > max_age_seconds:
                 logger.info("Session expired for %s", domain_or_url)
                 return False
-            # Ensure at least one cookie exists
-            return bool(data.get("cookies"))
+
+            # Accept session if cookies, localStorage, or sessionStorage contains auth data
+            has_cookies = bool(data.get("cookies"))
+            has_storage = bool(data.get("local_storage")) or bool(data.get("session_storage"))
+            return has_cookies or has_storage
         except Exception as e:
             logger.warning("Error reading session file %s: %s", session_path, e)
             return False
@@ -97,7 +123,7 @@ class SessionManager:
         local_storage: dict[str, Any] | None = None,
     ) -> Path:
         """Atomically saves the session payload to disk with chmod 600 permissions."""
-        normalized = self.normalize_domain(domain_or_url)
+        normalized = self.normalize_origin(domain_or_url)
         session_path = self.get_session_path(normalized)
 
         payload = {
@@ -108,17 +134,18 @@ class SessionManager:
             "local_storage": local_storage or {},
         }
 
-        # Atomic write: write to tempfile first, then rename
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=self.storage_dir,
-            delete=False,
-            encoding="utf-8",
-        ) as temp_file:
-            json.dump(payload, temp_file, indent=2)
-            temp_file_name = temp_file.name
-
+        # Safe atomic write: enclose temporary file lifecycle in try-finally
+        temp_file_name: str | None = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self.storage_dir,
+                delete=False,
+                encoding="utf-8",
+            ) as temp_file:
+                temp_file_name = temp_file.name
+                json.dump(payload, temp_file, indent=2)
+
             # Restrict file permissions to owner read/write (chmod 600)
             if os.name != "nt":
                 with contextlib.suppress(OSError):
@@ -129,7 +156,7 @@ class SessionManager:
             logger.info("Saved session for %s to %s", normalized, session_path.name)
             return session_path
         finally:
-            if os.path.exists(temp_file_name):
+            if temp_file_name and os.path.exists(temp_file_name):
                 with contextlib.suppress(OSError):
                     os.remove(temp_file_name)
 

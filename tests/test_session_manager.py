@@ -6,12 +6,32 @@ from core.session_manager import SessionManager
 
 
 def test_domain_normalization():
-    """Verify that domain strings and complex URLs normalize to clean lowercase hostnames."""
-    assert SessionManager.normalize_domain("reddit.com") == "reddit.com"
-    assert SessionManager.normalize_domain("https://Discord.com/login") == "discord.com"
+    """Verify that domain strings and complex URLs normalize to clean lowercase hostnames and distinct origins."""
+    assert SessionManager.normalize_origin("reddit.com") == "https://reddit.com"
+    assert SessionManager.normalize_origin("https://Discord.com/login") == "https://discord.com"
     assert (
-        SessionManager.normalize_domain("http://Sub.Domain.org:8080/path?q=1") == "sub.domain.org"
+        SessionManager.normalize_origin("http://Sub.Domain.org:8080/path?q=1")
+        == "http://sub.domain.org:8080"
     )
+    # Distinct origins produce distinct session file paths
+    manager = SessionManager(storage_dir=Path("/tmp/sessions"))
+    path_https = manager.get_session_path("https://example.com")
+    path_http = manager.get_session_path("http://example.com:8080")
+    assert path_https != path_http
+
+
+def test_storage_only_session_acceptance(tmp_path: Path):
+    """SPA apps with tokens in localStorage/sessionStorage (and 0 cookies) must be accepted."""
+    manager = SessionManager(storage_dir=tmp_path)
+    manager.save_session(
+        "https://discord.com",
+        cookies=[],  # 0 cookies
+        local_storage={"token": "jwt_secret_token_123"},
+    )
+    assert manager.has_valid_session("https://discord.com") is True
+    loaded = manager.load_session("https://discord.com")
+    assert loaded is not None
+    assert loaded["local_storage"]["token"] == "jwt_secret_token_123"
 
 
 def test_session_path_uses_sha256_hash(tmp_path: Path):
@@ -21,7 +41,7 @@ def test_session_path_uses_sha256_hash(tmp_path: Path):
 
     assert session_file.parent == tmp_path
     assert (
-        session_file.name == "a379a6f6eeafb9a55e378c118034e2751e682fab9f2d30ab13d2125586ce1947.json"
+        session_file.name == "100680ad546ce6a577f42f52df33b4cfdca756859e664b8d7de329b150d09ce9.json"
     )
 
 
@@ -45,7 +65,7 @@ def test_save_and_load_session(tmp_path: Path):
 
     loaded = manager.load_session("example.com")
     assert loaded is not None
-    assert loaded["domain"] == "example.com"
+    assert loaded["domain"] == "https://example.com"
     assert loaded["cookies"] == cookies
     assert loaded["session_storage"] == storage
     assert loaded["local_storage"] == {"theme": "dark"}
