@@ -2,7 +2,7 @@
 
 ## Document Purpose
 
-This document is the authoritative technical design specification for the **Autonomous Login Engine** in Tracepass. It defines the architecture, supported v1 login flow patterns (Types 1–6), credential management strategy, session lifecycle, edge case handling, worst-case scenarios, and time and space complexity analysis. The goal is to ensure that supported login pages are handled autonomously, while out-of-scope or anti-bot protected flows (Type 7 registration, CAPTCHAs, 2FA/OTP, email verification) are handled via explicit plugin interfaces, interactive prompts, or graceful error boundaries.
+This document is the authoritative technical design specification for the **Autonomous Login Engine** in Tracepass. It defines the Scrapling-native architecture, supported v1 login flow patterns (Types 1–9), credential management strategy, session lifecycle, edge case handling, worst-case scenarios, and time and space complexity analysis. The goal is to ensure that supported login pages are handled autonomously, while out-of-scope or anti-bot protected flows (Type 7 registration, OTP-primary, passkey without fallback) surface clear error boundaries and do not crash the broader scraping pipeline.
 
 ---
 
@@ -30,25 +30,26 @@ Web scraping tasks often require the agent to be in an authenticated state befor
 - Structural layout (single-step vs multi-step forms)
 - Rendering mechanism (server-rendered HTML vs dynamically injected JavaScript)
 - Anti-bot measures (CAPTCHA, device fingerprinting, rate limiting)
-- Authentication protocol (native forms, OAuth 2.0, SSO federation)
-- Session persistence strategy (cookie-based, JWT in `localStorage`, server-side sessions)
+- Authentication protocol (native forms, OAuth 2.0, SSO federation, OTP-primary, passkey/FIDO2)
+- Session persistence strategy (cookie-based, JWT in `localStorage`, IndexedDB refresh tokens, server-side sessions)
 
-A human navigates all of these intuitively. The Tracepass Login Engine replicates this intuition through a combination of semantic DOM analysis, stateful multi-turn execution, and intelligent session reuse.
+A human navigates all of these intuitively. The Tracepass Login Engine replicates this intuition through a combination of semantic DOM analysis, Scrapling's adaptive element relocation, stateful multi-turn execution via `page_action` callbacks, and intelligent session reuse via `auto_save`.
 
 **Core requirement**: Given a target URL and a set of credentials for supported v1 login flows (Types 1–6), the agent must:
 
 1. Detect the type of login flow present on the page.
 2. Execute the login sequence correctly, handling intermediate DOM states.
-3. Verify that authentication succeeded.
+3. Verify that authentication succeeded using a per-domain verification check.
 4. Persist the authenticated session so future requests to the same domain do not repeat the login.
-5. Gracefully handle out-of-scope flows (Type 7 registration, CAPTCHA, 2FA) via plugins, interactive prompts, or clear error boundaries without crashing the broader scraping pipeline.
+5. For Types 8 and 9, check for a password/OTP fallback path before raising `OTPPrimaryRequired` or `PasskeyRequired`.
+6. Gracefully handle out-of-scope flows (Type 7 registration, unresolvable OTP-primary, passkey with no fallback) via clear error boundaries without crashing the broader scraping pipeline.
 
 
 ---
 
 ## 2. Login Flow Taxonomy
 
-Every login flow encountered in the wild falls into one of the following categories. The Login Engine must handle each.
+Every login flow encountered in the wild falls into one of the following categories. The Login Engine classifies and handles Types 1–6 autonomously. Types 8 and 9 are handled with fallback detection before raising an error. Type 7 is always out of scope.
 
 ### Type 1: Standard Single-Step Form
 
@@ -75,9 +76,9 @@ Every login flow encountered in the wild falls into one of the following categor
 - A "Next" or "Continue" button is present.
 - After clicking, a new input of `type="password"` appears either on a new URL or injected into the same page.
 
-**Execution path**: Load page → Fill email → Click "Next" → Wait for DOM mutation → Fill password → Click "Sign In" → Verify.
+**Execution path**: Load page → Fill email → Click "Next" → Wait for DOM mutation (navigation or selector-appear, whichever fires first inside `page_action`) → Fill password → Click "Sign In" → Verify.
 
-**Key challenge**: The agent must detect whether the page navigated to a new URL or mutated in place, and not attempt to fill the password field before it is visible.
+**Key challenge**: The agent must race two possible outcomes after clicking Next: a full page navigation to a new URL, or an in-place DOM mutation that reveals the password field. Both must be handled inside the same `page_action` callback. See Section 7.2 for the correct implementation.
 
 ---
 
@@ -99,7 +100,7 @@ Every login flow encountered in the wild falls into one of the following categor
 
 ### Type 4: iFrame and Shadow DOM Login
 
-**Description**: The login inputs are embedded inside a cross-origin `<iframe>` element or inside a Shadow DOM tree. Standard DOM selectors and Playwright's default `page.fill()` calls fail because they operate on the top-level document.
+**Description**: The login inputs are embedded inside an `<iframe>` element or inside a Shadow DOM tree. Standard DOM selectors operating at the top-level document will not find these inputs.
 
 **Examples**: Embedded payment portals, enterprise identity providers embedded in SaaS dashboards, some banking sites.
 
@@ -108,9 +109,9 @@ Every login flow encountered in the wild falls into one of the following categor
 - Inspecting the iframe's document reveals `input[type="password"]`.
 - Shadow hosts with `shadowRoot` containing inputs.
 
-**Execution path**: Detect iframe presence → Switch execution context to iframe's content frame → Execute standard login within that frame → Switch back to parent frame → Verify.
+**Execution path**: Detect iframe presence → Switch execution context to iframe's content frame using Playwright's `frame_locator()` → Execute standard login within that frame → Switch back to parent frame → Verify.
 
-**Key challenge**: Cross-origin iframes have security restrictions. The agent must work within the same-origin policy. If the iframe is cross-origin, Playwright must navigate that frame directly.
+**Key challenge**: Playwright's frame API operates at the automation-protocol layer, above the page's own JavaScript sandbox. This means it is not subject to the browser's same-origin policy, which only restricts JavaScript executing inside the page context. This is true across all browser engines Scrapling targets (Camoufox/Firefox via StealthyFetcher) — the automation-protocol layer sits above the JS sandbox on all engines, regardless of the specific wire protocol each engine uses. `frame_locator()` can therefore access cross-origin iframes directly.
 
 ---
 
@@ -163,60 +164,132 @@ Every login flow encountered in the wild falls into one of the following categor
 
 ---
 
-## 3. System Architecture
+### Type 8: OTP-Primary / Magic Link
 
-The Login Engine is structured as a pipeline of 5 components that execute in sequence.
+**Description**: The site uses a one-time code or magic link as the **first and only** authentication factor. There is no password field at all. The user enters their email address, and a 6-digit code or a login link is sent to that address.
 
-```
-┌──────────────────────────────────┐
-│ A. Session Cache Checker         │
-│                                  │
-│ Input:  domain, session store    │
-│ Output: Valid session (skip)     │
-│         or No session (proceed)  │
-└──────────┬───────────────────────┘
-           │ No valid session
-           ▼
-┌──────────────────────────────────┐
-│ B. Credential Resolver           │
-│                                  │
-│ Input:  domain                   │
-│ Output: username, password       │
-│         or CredentialNotFound    │
-└──────────┬───────────────────────┘
-           │ Credentials resolved
-           ▼
-┌──────────────────────────────────┐
-│ C. Login Flow Analyzer           │
-│                                  │
-│ Input:  rendered page DOM        │
-│ Output: LoginFlowType enum       │
-│         field selector map       │
-└──────────┬───────────────────────┘
-           │ Flow type identified
-           ▼
-┌──────────────────────────────────┐
-│ D. Stealth Executor              │
-│                                  │
-│ Input:  flow type, selectors,    │
-│         credentials              │
-│ Output: post-login page state    │
-│         or ExecutionFailure      │
-└──────────┬───────────────────────┘
-           │ Execution complete
-           ▼
-┌──────────────────────────────────┐
-│ E. Verification and Session      │
-│    Persistence                   │
-│                                  │
-│ Input:  post-login page state    │
-│ Output: Authenticated session    │
-│         written to session store │
-│         or LoginFailure          │
-└──────────────────────────────────┘
-```
+**Examples**: Slack (magic link), Linear, many fintech and internal tooling apps.
+
+**Identifying signals**:
+- Email input is present but no password input appears anywhere in the flow.
+- A "Send code" or "Send login link" or "Email me a link" button is present.
+- After submission, a 6-digit input or a "check your email" message appears.
+
+**Execution path (code)**: Fill email → Click "Send code" → Wait for 6-digit OTP input → Check `TRACEPASS_OTP_<SAFE_DOMAIN>` env var; if set, fill and submit; otherwise raise `OTPPrimaryRequired` and pause for user input.
+
+**Execution path (magic link)**: Fill email → Click "Send link" → Raise `MagicLinkRequired`; the agent cannot access the user's inbox autonomously. Inform user to click the link in their email and re-run after the session is established.
+
+**v1 handling**: This type is handled with early detection. The engine raises `OTPPrimaryRequired` or `MagicLinkRequired` rather than hanging silently.
 
 ---
+
+### Type 9: Passkey / Biometric Authentication
+
+**Description**: The site presents a passkey (FIDO2/WebAuthn) prompt as its default authentication method. Passkeys require a hardware authenticator (platform authenticator, security key, Face ID, Touch ID) that exists outside the browser process and cannot be simulated.
+
+**Examples**: GitHub (passkey default), some banking apps, enterprise identity platforms.
+
+**Identifying signals**:
+- `navigator.credentials.get()` is called on page load or after email entry (detectable via Playwright's `page.route` or by observing the resulting DOM).
+- A button whose text matches `/(use passkey|sign in with passkey|passkey)/i` is present.
+- The WebAuthn API prompt appears.
+
+**Execution path**:
+1. Detect passkey signal (either method above).
+2. **Check for a visible password/OTP fallback link** — a link or button with text matching `/(use.*password|try another way|sign in.*differently|use.*different.*method)/i` in the same view.
+3. If a fallback exists → click it and continue with the appropriate standard flow (Type 1, 2, or 8).
+4. Only if no fallback is reachable → raise `PasskeyRequired: This site requires a passkey authenticator that cannot be automated. Use a password-based login method if available.`
+
+**Key nuance**: Many real-world sites with passkey UI (GitHub, several banks, consumer apps) still have a "use your password instead" or "try another way" link. Bailing out immediately on passkey detection would incorrectly fail logins that are still automatable through that fallback path.
+
+
+
+## 3. System Architecture
+
+The Login Engine is structured as a pipeline of 5 components. The architecture is **Scrapling-native**: stealth browsing, session persistence, and adaptive element relocation are provided by Scrapling and are not re-implemented. The components we build sit on top of Scrapling's primitives.
+
+### 3.1 What Scrapling Provides (Do Not Re-implement)
+
+| Scrapling Feature | What It Replaces in a Raw Playwright Stack |
+| :--- | :--- |
+| `StealthyFetcher` (Camoufox/Firefox) | Manual browser fingerprint patching, stealth headers, canvas/WebGL spoofing |
+| `auto_save` | Custom session serialization and persistence logic |
+| `adaptive` relocation | Priority-order CSS selector waterfall for known domains |
+| `page_action` callbacks | Raw `async with page.expect_navigation()` / `wait_for_selector()` patterns |
+
+### 3.2 What We Build (The 5 Components)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ A. Session Cache Checker                                 │
+│                                                          │
+│ Input:  domain, ~/.tracepass/sessions/ store             │
+│ Output: Valid session (skip login entirely)              │
+│         or No session (proceed to B)                     │
+│ Built on: Scrapling auto_save + domain hash lookup       │
+└──────────┬───────────────────────────────────────────────┘
+           │ No valid session
+           ▼
+┌──────────────────────────────────────────────────────────┐
+│ B. Credential Resolver                                   │
+│                                                          │
+│ Input:  domain                                           │
+│ Output: username, password (in process memory only)      │
+│         or CredentialNotFound                            │
+│ Built on: OS keyring (keyring lib) + AES-256-GCM fallback│
+└──────────┬───────────────────────────────────────────────┘
+           │ Credentials resolved
+           ▼
+┌──────────────────────────────────────────────────────────┐
+│ C. Login Flow Analyzer + Field Detector                  │
+│                                                          │
+│ Input:  rendered page DOM                                │
+│ Output: LoginFlowType enum (Types 1–9)                   │
+│         field selector map (adaptive for known domains,  │
+│         discovery waterfall for unknown domains)         │
+│ Built on: Scrapling adaptive + custom discovery rules    │
+└──────────┬───────────────────────────────────────────────┘
+           │ Flow type and fields identified
+           ▼
+┌──────────────────────────────────────────────────────────┐
+│ D. Login Executor (via page_action)                      │
+│                                                          │
+│ Input:  flow type, field selectors, credentials          │
+│ Output: post-login page state, or ExecutionFailure       │
+│ Built on: Scrapling StealthyFetcher + page_action        │
+│ Note:  stealth (timing, mouse paths, fingerprint         │
+│         evasion) is handled by StealthyFetcher.          │
+│         page_action provides the multi-step callback     │
+│         extension point. We write the race logic inside. │
+└──────────┬───────────────────────────────────────────────┘
+           │ Execution complete
+           ▼
+┌──────────────────────────────────────────────────────────┐
+│ E. Authentication Verifier                               │
+│                                                          │
+│ Input:  post-login page state                            │
+│ Output: Verified authenticated session                   │
+│         written to session store via auto_save           │
+│         or LoginFailure                                  │
+│ Built on: Per-domain registered verification checks      │
+│           + generic fallback heuristic                   │
+│ Note:  Scrapling provides session storage. We provide    │
+│        the "did login actually succeed?" logic.          │
+│        No scraping library gives you this check.         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 3.3 Open Research Item: IndexedDB Session Tokens
+
+**Before trusting Scrapling's session support on Firebase-Auth-based SPAs, explicitly verify what `auto_save` / `storage_state()` actually captures.** Playwright's `BrowserContext.storage_state()` natively captures cookies and `localStorage`. Tracepass's Section 5.1 adds a custom `sessionStorage` capture via `page.evaluate()`. However, **IndexedDB** — where Firebase Authentication stores its refresh tokens — is not covered by any of these mechanisms.
+
+A large category of real apps (Firebase, Supabase, AWS Amplify Auth) store their authentication state in IndexedDB, not cookies or `localStorage`. If `auto_save` does not capture IndexedDB, those apps will appear to be logged out on every re-run despite a "saved" session.
+
+**Action required at Step 1 of the build order**: Point `StealthyFetcher` at one or two Firebase-Auth-backed apps and explicitly verify whether the saved session state survives a new `StealthyFetcher` context creation. If it does not, Section 5 needs a custom IndexedDB capture and restore step (via `page.evaluate("async () => { /* IDBKeyRange.only scan */ }")`). Do not assume this works until you have observed it.
+
+---
+
+
 
 ## 4. Credential Management
 
@@ -314,7 +387,32 @@ The Login Flow Analyzer builds a **field selector map** through semantic analysi
 
 ### 6.1 Username / Email Field Detection
 
-Priority order (highest to lowest confidence):
+## 6. Field Detection Strategy
+
+The Login Flow Analyzer operates in two modes depending on whether the domain has been seen before.
+
+### 6.0 Two-Mode Detection
+
+**Adaptive Mode (Known Domain)**: If `adaptive` element records exist for this domain from a previous successful login, Scrapling's `adaptive` feature uses stored multi-signal fingerprints (element text, position, surrounding structure) to relocate the correct fields even if the site's DOM structure has changed. This is the preferred path — it is fast, robust to A/B tests and DOM refactors, and requires no regex matching.
+
+**Discovery Mode (Unknown Domain)**: If no adaptive records exist, the analyzer runs the discovery waterfall below for each field type. Once a successful login is complete, the resolved selectors are persisted via `adaptive` so that subsequent runs on the same domain use Adaptive Mode.
+
+### 6.1 Honeypot Pre-Filter (Runs Before All Other Detection)
+
+Before any candidate input is scored by the discovery waterfall, it must pass the honeypot pre-filter. Honeypot inputs are invisible inputs that anti-bot systems place in forms — real users never see or fill them, but naive scrapers do, triggering bot detection.
+
+**Exclude any input that meets any of the following conditions**:
+- Computed CSS `display` is `none`
+- Computed CSS `visibility` is `hidden`
+- Computed CSS `opacity` is `0`
+- Element bounding box has zero width or zero height
+- Element is positioned off-screen (e.g., `position: absolute; left < -500px` or `top < -500px`)
+
+Note: `input[type="hidden"]` fields are never candidates for filling and never reach this filter.
+
+### 6.2 Username / Email Field Detection (Discovery Mode)
+
+Priority order (highest to lowest confidence), applied only to inputs that passed the honeypot pre-filter:
 
 1. `input[autocomplete="username"]`
 2. `input[autocomplete="email"]`
@@ -323,11 +421,11 @@ Priority order (highest to lowest confidence):
 5. `input[type="text"]` with a `placeholder` or `aria-label` matching regex `/(email|username|user name|phone number)/i`
 6. `input[type="text"]` that is the first visible text input on the page
 
-### 6.2 Password Field Detection
+### 6.3 Password Field Detection (Discovery Mode)
 
 1. `input[type="password"]` — this is unambiguous. If multiple exist, the first one is the "current password" and a second one is "confirm password" (used in registration flows, which are out of scope).
 
-### 6.3 Submit Button Detection
+### 6.4 Submit Button Detection (Discovery Mode)
 
 Priority order:
 
@@ -336,14 +434,14 @@ Priority order:
 3. A `<div role="button">` or `<a>` with matching text
 4. The first clickable element within the same container as the password field
 
-### 6.4 "Next" Button Detection (Multi-Step Flows)
+### 6.5 "Next" Button Detection (Multi-Step Flows)
 
 Detected when only the username field is visible and no password field is present:
 
 1. A `<button>` with inner text matching `/(next|continue|proceed)/i`
 2. `button[type="submit"]` when only one input is present
 
-### 6.5 Modal Trigger Detection
+### 6.6 Modal Trigger Detection
 
 Detected when no login inputs are present in the current DOM:
 
@@ -357,31 +455,54 @@ Detected when no login inputs are present in the current DOM:
 
 ### 7.1 Human-Realistic Input Timing
 
-To avoid triggering bot-detection systems that measure typing speed, all field fills use character-by-character input with randomized inter-keystroke delay:
+Scrapling's `StealthyFetcher` handles browser-level stealth (fingerprint patching, canvas/WebGL spoofing, realistic user-agent rotation). For input-level humanization inside `page_action` callbacks:
 
-- Delay per character: random value between 50ms and 150ms.
+- Delay per character: random value between 50ms and 150ms (character-by-character via Playwright's `type()` with delay).
 - Pause before clicking submit: random value between 300ms and 800ms.
-- Mouse movement to submit button follows a simulated curved path (Playwright's `locator.hover()` before `click()`).
+- Mouse movement to submit button uses `locator.hover()` before `click()`.
 
-This is a direct use of Scrapling's stealth capabilities combined with Playwright's low-level input APIs.
+Do not re-implement browser fingerprint stealth — `StealthyFetcher` already handles it.
 
 ### 7.2 Multi-Step Login Execution Flow
 
+**Important**: This flow is implemented as a `page_action` callback passed to `StealthyFetcher`, not as raw sequential Playwright calls. The key correctness requirement is that the race between navigation and DOM mutation must be resolved inside the callback — both outcomes must be handled, not just one.
+
+```python
+async def multi_step_page_action(page):
+    # Step 1: Fill email with humanized timing
+    await fill_humanized(page, username_field_selector, username)
+
+    # Step 2: Race navigation vs. DOM mutation — arm BOTH waiters before the click.
+    # Use asyncio.wait with FIRST_COMPLETED to handle whichever fires first.
+    nav_waiter = page.wait_for_navigation(timeout=10_000)
+    selector_waiter = page.wait_for_selector(
+        "input[type='password']", state="visible", timeout=10_000
+    )
+    await next_button.click()
+
+    done, pending = await asyncio.wait(
+        [asyncio.ensure_future(nav_waiter), asyncio.ensure_future(selector_waiter)],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()  # Cancel the waiter that didn't fire
+
+    # Step 3: If navigation fired, wait for password field to appear on new URL.
+    #         If selector fired, password field is already in the DOM — proceed directly.
+    await page.wait_for_selector("input[type='password']", state="visible", timeout=5_000)
+
+    # Step 4: Fill password, arm navigation waiter before submit click
+    await fill_humanized(page, password_field_selector, password)
+    async with page.expect_navigation(timeout=15_000):
+        await submit_button.click()
+
+    # Step 5: Hand off to Authentication Verifier (Component E)
 ```
-1.  Navigate to login URL.
-2.  Detect only email/username input is visible.
-3.  Fill email input with human-realistic timing.
-4.  Arm navigation/DOM waiters BEFORE triggering the click (prevents race conditions):
-      async with page.expect_navigation() (or page.expect_selector("input[type=password]")):
-          await next_button.click()
-5.  Timeout: 10 seconds. On timeout: raise MultiStepTransitionTimeout.
-6.  Fill password input with human-realistic timing.
-7.  Arm navigation waiter BEFORE clicking submit:
-      async with page.expect_navigation():
-          await submit_button.click()
-8.  Wait for navigation or authenticated DOM state.
-9.  Proceed to Verification.
-```
+
+**Timeout**: 10 seconds for the first transition. If both `nav_waiter` and `selector_waiter` time out, raise `MultiStepTransitionTimeout`.
+
+**Why `asyncio.FIRST_COMPLETED` instead of a static choice**: A site like Google may navigate to a new URL. A site like LinkedIn may inject the password field into the same page without navigating. The race logic must handle both without assuming which will fire. Picking one statically (navigation OR selector-appear) causes silent hangs on sites that take the other path.
+
 
 ### 7.3 Modal Login Execution Flow
 
@@ -666,35 +787,50 @@ credentials via TRACEPASS_CREDS in .env or via the interactive prompt on next ru
 
 ## 12. Implementation Checklist
 
-Track progress here as work begins. Mark each item when the corresponding code is merged to `main`.
+Track progress here as work begins. Mark each item when the corresponding code is merged to `main`. The order below follows the recommended 7-step build sequence.
 
-### Core Pipeline
-- [ ] `core/login_engine.py` — main orchestrator implementing the 5-component pipeline
-- [ ] `core/session_manager.py` — session read, write, validate, and invalidate
-- [ ] `core/credential_manager.py` — OS keyring + AES-256-GCM encrypted file fallback
-- [ ] `core/field_detector.py` — semantic DOM analysis for all 5 field types (username, password, submit, next-button, modal-trigger)
-- [ ] `core/login_executor.py` — stealth execution dispatcher per login flow type
+### Step 1: Observation (Before Writing Any Code)
+- [ ] Point `StealthyFetcher` at 2–3 real Type 1 login pages. Observe actual behavior of `auto_save`, `adaptive`, and `page_action` firsthand.
+- [ ] **IndexedDB research**: Point `StealthyFetcher` at a Firebase-Auth-backed SPA. Verify whether the saved session survives context recreation. Document the result in Section 5 of this doc before proceeding.
 
-### Login Flow Handlers
+### Step 2: Field Detection Module
+- [ ] `core/field_detector.py` — honeypot pre-filter + two-mode detection (adaptive for known domains, discovery waterfall for unknown domains). Covers all 5 field types (username, password, submit, next-button, modal-trigger).
+- [ ] `tests/test_field_detector.py` — unit tests against static HTML fixtures for all 5 field types including honeypot cases.
+
+### Step 3: Adaptive Durability Proof
+- [ ] Prove that `adaptive` relocation works after deliberately mangling a known site's DOM IDs and classes in a local copy. Document result. Only proceed to Step 4 after this passes.
+
+### Step 4: Multi-Step Handler (Highest Risk)
+- [ ] `core/handlers/multi_step.py` — Type 2 handler using `asyncio.FIRST_COMPLETED` race inside `page_action`. Add logging on both branches (navigation fired / selector-appeared) until both have been observed firing correctly.
+- [ ] `tests/integration/test_multi_step_login.py` — integration test against a real Google-style split-login flow.
+
+### Step 5: OTP-Primary and Passkey Early Bail-Outs
+- [ ] `core/handlers/otp_primary.py` — Type 8: detect OTP-primary and magic link flows; check `TRACEPASS_OTP_<SAFE_DOMAIN>` env var; surface `OTPPrimaryRequired` or `MagicLinkRequired`.
+- [ ] `core/handlers/passkey.py` — Type 9: detect passkey via `navigator.credentials.get()` call and button text; check for password/OTP fallback link before raising `PasskeyRequired`.
+
+### Step 6: Session Persistence and Authentication Verifier
+- [ ] `core/session_manager.py` — session read, write, validate, invalidate. Built on Scrapling `auto_save`. Includes custom `sessionStorage` capture. Includes IndexedDB capture if Step 1 research showed it is needed.
+- [ ] `core/auth_verifier.py` — Component E: per-domain registered verification checks + generic fallback heuristic. This is not provided by any library and must be built.
+- [ ] `tests/test_session_manager.py` — session read, write, expiry, and invalidation.
+
+### Step 7: Credential Management and Plugin Interfaces
+- [ ] `core/credential_manager.py` — OS keyring (primary) + AES-256-GCM encrypted file fallback with full file format spec from Decision 4.
+- [ ] `core/captcha_solver.py` — opt-in CAPTCHA solver plugin (2captcha, anticaptcha backends).
+- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<SAFE_DOMAIN>` env bypass (domain normalized to uppercase, dots and dashes replaced by underscores, e.g. `TRACEPASS_OTP_EXAMPLE_COM`).
+- [ ] `core/retry_policy.py` — failure-type-specific retry logic table.
+- [ ] `tests/test_credential_manager.py` — keyring and AES-256-GCM encrypted file fallback behavior.
+- [ ] `tests/test_retry_policy.py` — unit test for each failure type's retry behavior.
+
+### Remaining Login Flow Handlers (Can Parallel After Step 4)
+- [ ] `core/login_engine.py` — main orchestrator: Session Cache Checker → Credential Resolver → Login Flow Analyzer → Login Executor → Authentication Verifier
 - [ ] `core/handlers/single_step.py` — Type 1: Standard single-step form
-- [ ] `core/handlers/multi_step.py` — Type 2: Multi-step / split login (Google, Microsoft style)
 - [ ] `core/handlers/modal_login.py` — Type 3: Modal and overlay login
 - [ ] `core/handlers/iframe_login.py` — Type 4: iFrame and Shadow DOM login
 - [ ] `core/handlers/oauth_login.py` — Type 5: OAuth / SSO redirect and popup
-
-### Supporting Infrastructure
-- [ ] `core/captcha_solver.py` — opt-in CAPTCHA solver plugin (2captcha, anticaptcha backends)
-- [ ] `core/otp_handler.py` — blocking terminal prompt + `TRACEPASS_OTP_<SAFE_DOMAIN>` env bypass (domain normalized to uppercase with dots/dashes replaced by underscores)
-- [ ] `core/retry_policy.py` — failure-type-specific retry logic table
-
-### Tests
-- [ ] `tests/test_session_manager.py` — session read, write, expiry, and invalidation
-- [ ] `tests/test_field_detector.py` — unit tests against static HTML fixtures for all 5 field types (username, password, submit, next-button, modal-trigger)
-- [ ] `tests/test_retry_policy.py` — unit test for each failure type's retry behavior
-- [ ] `tests/test_credential_manager.py` — keyring and AES-256-GCM encrypted file fallback behavior
 - [ ] `tests/integration/test_single_step_login.py` — integration test against local mock login server
-- [ ] `tests/integration/test_multi_step_login.py` — integration test for multi-step flow
 
 ### Documentation
 - [ ] Update `README.md` — add Authentication section documenting the Login Engine
-- [ ] `CONTRIBUTING.md` — guide for adding new login flow handlers
+- [ ] `CONTRIBUTING.md` — guide for adding new login flow handlers and domain-specific auth verifiers
+
+> **Note**: `core/login_executor.py` (stealth execution dispatcher) has been removed from this checklist. Scrapling's `StealthyFetcher` + `page_action` replaces this component entirely. Do not build it.

@@ -76,8 +76,8 @@ def test_login_flow_taxonomy_matches_v1_scope_across_documents():
     taxonomy = section(design, "## 2. Login Flow Taxonomy")
     flow_headings = re.findall(r"(?m)^### Type (\d+): (.+)$", taxonomy)
 
-    assert [number for number, _ in flow_headings] == [str(number) for number in range(1, 8)]
-    assert "Types 1–6" in section(design, "## Document Purpose")
+    assert [number for number, _ in flow_headings] == [str(number) for number in range(1, 10)]
+    assert "Types 1–9" in section(design, "## Document Purpose")
     assert "Type 7 registration" in section(design, "## Document Purpose")
 
     readme_flows = markdown_rows(section(readme, "### Planned Supported Login Flow Types (v1)"))
@@ -99,8 +99,8 @@ def test_design_toc_and_architecture_cover_the_complete_pipeline():
         "Session Cache Checker",
         "Credential Resolver",
         "Login Flow Analyzer",
-        "Stealth Executor",
-        "Verification and Session",
+        "Login Executor",
+        "Authentication Verifier",
     ]
     assert all(component in architecture for component in components)
 
