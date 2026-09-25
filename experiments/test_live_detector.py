@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-# Add project root to sys.path so Python finds 'core'
+# Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import asyncio
@@ -9,36 +9,62 @@ from scrapling.fetchers import StealthyFetcher
 from core.field_detector import FieldDetector
 
 
-async def test_site(name: str, url: str, wait_sel: str = "input"):
-    print(f"\n==========================================")
-    print(f" Live Test: {name}")
-    print(f" URL: {url}")
-    print(f"==========================================")
+async def main():
+    target_url = "https://the-internet.herokuapp.com/login"
+    username = "tomsmith"
+    password = "SuperSecretPassword!"
+
+    print("==========================================")
+    print(" 1. Detecting Login Fields on Target URL")
+    print("==========================================")
     fetcher = StealthyFetcher()
 
-    print("Fetching page with Camoufox...")
-    result = await fetcher.async_fetch(url, wait_selector=wait_sel, timeout=15000)
+    # Step 1: Detect fields using our FieldDetector
+    detect_res = await fetcher.async_fetch(target_url, wait_selector="input")
+    fields = FieldDetector.detect_fields(detect_res)
+    print(f"Detected fields: {fields}")
 
-    # Run our new FieldDetector
-    detected = FieldDetector.detect_fields(result)
+    # Step 2: Define the page_action callback that types and clicks
+    async def perform_login(page):
+        print("\n[Browser Action]: Typing username with human delay...")
+        await page.locator(fields["username"]).press_sequentially(
+            username, delay=100
+        )
 
-    print("\n[Detected Field Selector Map]:")
-    for field_name, selector in detected.items():
-        print(f"  - {field_name.ljust(15)} : {selector}")
+        print("[Browser Action]: Typing password with human delay...")
+        await page.locator(fields["password"]).press_sequentially(
+            password, delay=100
+        )
 
+        print("[Browser Action]: Clicking submit button...")
+        await page.locator(fields["submit"]).hover()
+        await page.locator(fields["submit"]).click()
 
-async def main():
-    # 1. Classic Form
-    await test_site("Classic Type 1", "https://the-internet.herokuapp.com/login")
+        # Wait for page to navigate / update
+        await page.wait_for_load_state("networkidle")
 
-    # 2. Reddit Web Components
-    await test_site("Reddit", "https://www.reddit.com/login/", wait_sel="shreddit-app")
+    print("\n==========================================")
+    print(" 2. Executing Automated Stealth Login")
+    print("==========================================")
 
-    # 3. Discord React SPA
-    await test_site("Discord", "https://discord.com/login", wait_sel="input[name='email'], input")
+    # Step 3: Fetch with page_action executed inside the browser!
+    login_result = await fetcher.async_fetch(
+        target_url,
+        page_action=perform_login,
+    )
 
-    # 4. LinkedIn Enterprise Auth
-    await test_site("LinkedIn", "https://www.linkedin.com/login", wait_sel="input[type='password'], input")
+    print(f"\nFinal URL: {login_result.url}")
+    print(f"Status Code: {login_result.status}")
+
+    # Check if login succeeded (Look for the success flash message)
+    flash_message = login_result.css("#flash, .flash")
+    if flash_message:
+        print(f"\n🎉 Server Response Message: {flash_message[0].text.strip()}")
+
+    # Inspect the saved cookies from the session
+    print(f"\nAuthenticated Cookies captured:")
+    for cookie in login_result.cookies:
+        print(f"  - {cookie}")
 
 
 if __name__ == "__main__":
