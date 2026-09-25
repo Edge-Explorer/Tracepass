@@ -112,3 +112,85 @@ def test_web_components_and_custom_tags():
     assert fields["username"] is not None
     assert fields["password"] is not None
     assert fields["submit"] is not None
+
+
+def test_ancestor_honeypot_filtering():
+    """Inputs inside hidden/display:none ancestor containers must be filtered out."""
+    html = """
+    <form>
+        <div style="display:none">
+            <input type="text" name="trap_in_hidden_div">
+        </div>
+        <div hidden>
+            <input type="email" name="trap_in_hidden_attr">
+        </div>
+        <input id="real_user" type="text" name="user" autocomplete="username">
+        <input id="real_pass" type="password" name="password">
+        <button type="submit">Sign In</button>
+    </form>
+    """
+    page = Adaptor(html)
+    fields = FieldDetector.detect_fields(page)
+
+    user_el = page.css(fields["username"])[0]
+    assert user_el.attrib.get("id") == "real_user"
+
+
+def test_nested_span_button_text_matching():
+    """Buttons with text inside nested <span> or child tags must match."""
+    html = """
+    <form>
+        <input type="email" name="email">
+        <input type="password" name="password">
+        <button class="btn">
+            <span class="icon"></span>
+            <span class="label">Sign In</span>
+        </button>
+    </form>
+    """
+    page = Adaptor(html)
+    fields = FieldDetector.detect_fields(page)
+
+    assert fields["submit"] is not None
+
+
+def test_form_scoped_submit_button():
+    """Submit button inside the login form must be preferred over preceding forms."""
+    html = """
+    <!-- Preceding newsletter form -->
+    <form id="newsletter">
+        <input type="text" name="email_newsletter">
+        <button id="btn_newsletter" type="submit">Subscribe</button>
+    </form>
+
+    <!-- Actual login form -->
+    <form id="login">
+        <input id="usr" type="email" autocomplete="username">
+        <input id="pwd" type="password" autocomplete="current-password">
+        <button id="btn_login" type="submit">Log In</button>
+    </form>
+    """
+    page = Adaptor(html)
+    fields = FieldDetector.detect_fields(page)
+
+    sub_el = page.css(fields["submit"])[0]
+    assert sub_el.attrib.get("id") == "btn_login"
+
+
+def test_search_input_does_not_block_modal_trigger():
+    """An unrelated search box on a page must not prevent modal trigger detection."""
+    html = """
+    <header>
+        <input type="text" name="q" placeholder="Search the store">
+        <button aria-haspopup="dialog" class="auth-trigger">Sign In</button>
+    </header>
+    <main>
+        <h1>Store Products</h1>
+    </main>
+    """
+    page = Adaptor(html)
+    fields = FieldDetector.detect_fields(page)
+
+    assert fields["modal-trigger"] is not None
+    assert fields["username"] is None
+    assert fields["password"] is None
