@@ -7,7 +7,7 @@ from core.handlers.modal_login import ModalLoginHandler, ModalTriggerTimeout
 
 @pytest.mark.anyio
 async def test_modal_login_success_with_trigger():
-    """Verify that ModalLoginHandler clicks the trigger, waits for modal, and scopes input actions."""
+    """Verify that ModalLoginHandler clicks the trigger, waits for modal, scopes input actions, and waits for modal to close."""
     handler = ModalLoginHandler(
         username="test_user",
         password="secret_password",
@@ -57,8 +57,13 @@ async def test_modal_login_success_with_trigger():
 
     # Check trigger was clicked
     mock_trigger.click.assert_called_once()
-    # Check dialog container wait
-    mock_page.wait_for_selector.assert_called_once()
+    # Check dialog container was waited on to open (visible) and close (hidden)
+    mock_page.wait_for_selector.assert_any_call(
+        ModalLoginHandler.DEFAULT_MODAL_CONTAINER, state="visible", timeout=1000
+    )
+    mock_page.wait_for_selector.assert_any_call(
+        ModalLoginHandler.DEFAULT_MODAL_CONTAINER, state="hidden", timeout=1000
+    )
     # Check scoped fields were typed into
     mock_user_input.press_sequentially.assert_called_once_with("test_user", delay=0)
     mock_pass_input.press_sequentially.assert_called_once_with("secret_password", delay=0)

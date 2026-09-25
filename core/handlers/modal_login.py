@@ -5,6 +5,7 @@ Implements Section 7.3 of docs/login-engine.md:
 - Waits for the dialog container ([role='dialog'], [aria-modal='true']) to appear.
 - Scopes field interaction strictly within the modal container.
 - Fills credentials with humanized delays and submits.
+- Waits for modal to close (state="hidden") and page/network to settle.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ class ModalLoginHandler:
             await trigger_locator.click()
 
             # Step 2: Wait for modal container to become visible
-            logger.info("Waiting for modal dialog container: %s", container_sel)
+            logger.info("Waiting for modal dialog container to appear: %s", container_sel)
             try:
                 await page.wait_for_selector(
                     container_sel, state="visible", timeout=self.modal_timeout_ms
@@ -104,7 +105,18 @@ class ModalLoginHandler:
             logger.info("Submitting modal form via Enter key on password field")
             await pass_input.press("Enter")
 
-        # Step 5: Wait for settlement
+        # Step 5: Wait for modal to close (hidden / detached) as required by Section 7.3
+        if modal_trigger_sel:
+            logger.info("Waiting for modal dialog container to close: %s", container_sel)
+            try:
+                await page.wait_for_selector(container_sel, state="hidden", timeout=self.timeout_ms)
+            except Exception:
+                logger.debug(
+                    "Modal container did not transition to hidden within %sms, checking network...",
+                    self.timeout_ms,
+                )
+
+        # Step 6: Wait for page/network requests to settle
         try:
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
