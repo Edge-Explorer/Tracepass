@@ -1,8 +1,7 @@
-"""iFrame and Shadow DOM Login (Type 4) Flow Handler.
+"""iFrame Login (Type 4) Flow Handler.
 
 Implements Section 2 (Type 4) of docs/login-engine.md:
 - Traverses cross-origin and same-origin iframes using frame locators.
-- Pierces open Shadow DOM trees seamlessly.
 - Fills credentials with humanized delays inside the frame context.
 - Submits form and waits for settlement.
 """
@@ -30,6 +29,15 @@ class IframeLoginHandler:
         iframe_timeout_ms: int = 8000,
         timeout_ms: int = 15000,
     ) -> None:
+        """Initializes the iframe login handler with credentials and timeout configurations.
+
+        Args:
+            username: Username or email to input.
+            password: Password to input.
+            typing_delay_ms: Delay in milliseconds between keystrokes.
+            iframe_timeout_ms: Max time to wait for iframe attachment in milliseconds.
+            timeout_ms: Max time to wait for network settlement post-submission.
+        """
         self.username = username
         self.password = password
         self.typing_delay_ms = typing_delay_ms

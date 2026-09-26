@@ -1,3 +1,5 @@
+"""Tests for iFrame login handler."""
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,6 +29,7 @@ async def test_iframe_login_success_with_submit():
     mock_page.wait_for_load_state = AsyncMock()
 
     def frame_locator_side_effect(selector: str):
+        """Mock frame locator routing by selector."""
         if selector == "#user":
             return mock_user_input
         if selector == "#pass":
@@ -74,7 +77,11 @@ async def test_iframe_login_enter_fallback():
     mock_page.frame_locator.return_value = mock_frame
     mock_page.wait_for_load_state = AsyncMock()
 
-    mock_frame.locator.side_effect = lambda s: mock_user_input if s == "#user" else mock_pass_input
+    def frame_locator_side_effect(selector: str):
+        """Mock frame locator returning user or pass input."""
+        return mock_user_input if selector == "#user" else mock_pass_input
+
+    mock_frame.locator.side_effect = frame_locator_side_effect
 
     fields = {
         "iframe": "#frame",
@@ -100,6 +107,7 @@ async def test_iframe_not_found_raises():
     mock_page = MagicMock()
 
     async def timeout_fn(*args, **kwargs):
+        """Simulate timeout waiting for iframe selector."""
         raise TimeoutError("iframe not attached")
 
     mock_page.wait_for_selector = AsyncMock(side_effect=timeout_fn)
