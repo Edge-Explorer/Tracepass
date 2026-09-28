@@ -6,6 +6,7 @@ import pytest
 
 from core.handlers.otp_primary import (
     MagicLinkRequired,
+    OTPOriginMismatch,
     OTPPrimaryHandler,
     OTPPrimaryRequired,
 )
@@ -20,13 +21,23 @@ def test_env_domain_normalization():
     )
 
 
+def test_collision_free_env_key():
+    """Verify collision-free env key generation distinguishes dots and hyphens."""
+    dash_key = OTPPrimaryHandler.get_collision_free_env_key("foo-bar.com")
+    dot_key = OTPPrimaryHandler.get_collision_free_env_key("foo.bar.com")
+    assert dash_key != dot_key
+    assert "DASH" in dash_key
+    assert "DOT" in dot_key
+
+
 @pytest.mark.anyio
 async def test_otp_primary_with_env_code(monkeypatch: pytest.MonkeyPatch):
     """Verify OTP submission when TRACEPASS_OTP_<DOMAIN> is set."""
     monkeypatch.setenv("TRACEPASS_OTP_EXAMPLE_COM", "654321")
 
-    handler = OTPPrimaryHandler(typing_delay_ms=0)
+    handler = OTPPrimaryHandler(typing_delay_ms=0, allow_interactive=False)
     mock_page = MagicMock()
+    mock_page.url = "https://example.com/login"
     mock_input = AsyncMock()
     mock_btn = AsyncMock()
 
@@ -52,10 +63,23 @@ async def test_otp_primary_with_env_code(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.anyio
-async def test_otp_primary_missing_env_raises():
-    """If no OTP code is provided in environment, OTPPrimaryRequired is raised."""
-    handler = OTPPrimaryHandler()
+async def test_otp_primary_origin_mismatch_raises(monkeypatch: pytest.MonkeyPatch):
+    """If page URL origin does not match expected target domain, OTPOriginMismatch is raised."""
+    monkeypatch.setenv("TRACEPASS_OTP_EXAMPLE_COM", "654321")
+    handler = OTPPrimaryHandler(allow_interactive=False)
     mock_page = MagicMock()
+    mock_page.url = "https://malicious-phishing.com/login"
+
+    with pytest.raises(OTPOriginMismatch, match="does not match expected target domain"):
+        await handler.execute(mock_page, "example.com", {})
+
+
+@pytest.mark.anyio
+async def test_otp_primary_missing_env_raises():
+    """If no OTP code is provided and interactive is disabled, OTPPrimaryRequired is raised."""
+    handler = OTPPrimaryHandler(allow_interactive=False)
+    mock_page = MagicMock()
+    mock_page.url = "https://unknown.com/auth"
 
     with pytest.raises(OTPPrimaryRequired, match="OTP authentication required for 'unknown.com'"):
         await handler.execute(mock_page, "unknown.com", {})
@@ -64,7 +88,7 @@ async def test_otp_primary_missing_env_raises():
 @pytest.mark.anyio
 async def test_magic_link_detected_raises():
     """If magic link is detected, MagicLinkRequired is raised immediately."""
-    handler = OTPPrimaryHandler()
+    handler = OTPPrimaryHandler(allow_interactive=False)
     mock_page = MagicMock()
 
     with pytest.raises(MagicLinkRequired, match="Magic link login required for 'slack.com'"):

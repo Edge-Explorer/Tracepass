@@ -2,8 +2,9 @@
 
 Implements Section 2 (Type 8) & Section 11 (Decision 2) of docs/login-engine.md:
 - Detects OTP-only and Magic Link authentication flows.
-- Normalizes domain names to shell-safe uppercase environment variable keys (TRACEPASS_OTP_<SAFE_DOMAIN>).
-- Automatically fills OTP codes from environment variables in CI/headless modes.
+- Normalizes domain names to shell-safe uppercase environment variable keys.
+- Validates page origin before injecting OTP secrets.
+- Supports interactive terminal input when running locally and automated env bypass in CI.
 - Surfaces clear error boundaries (OTPPrimaryRequired / MagicLinkRequired) without crashing pipelines.
 """
 
@@ -12,7 +13,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from typing import Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,10 @@ class MagicLinkRequired(Exception):
         )
 
 
+class OTPOriginMismatch(Exception):
+    """Raised when the active page origin does not match the target authentication domain."""
+
+
 class OTPPrimaryHandler:
     """Handles detection and submission for OTP-primary (Type 8) authentication."""
 
@@ -51,15 +58,18 @@ class OTPPrimaryHandler:
         self,
         typing_delay_ms: int = 50,
         timeout_ms: int = 15000,
+        allow_interactive: bool = True,
     ) -> None:
         """Initializes OTPPrimaryHandler.
 
         Args:
             typing_delay_ms: Keystroke delay in milliseconds.
             timeout_ms: Max time to wait for network settlement post-submission.
+            allow_interactive: Whether to prompt via terminal input when env var is missing.
         """
         self.typing_delay_ms = typing_delay_ms
         self.timeout_ms = timeout_ms
+        self.allow_interactive = allow_interactive
 
     @staticmethod
     def normalize_domain_to_env_key(domain: str) -> str:
@@ -73,15 +83,78 @@ class OTPPrimaryHandler:
         if "://" in clean_domain:
             clean_domain = clean_domain.split("://", 1)[1]
         clean_domain = clean_domain.split("/", 1)[0]
-        # Replace non-alphanumerics with underscores
         safe_key = re.sub(r"[^a-zA-Z0-9]", "_", clean_domain).strip("_").upper()
         return safe_key
 
-    def get_env_otp_code(self, domain: str) -> str | None:
-        """Retrieves OTP code from TRACEPASS_OTP_<SAFE_DOMAIN> if set."""
+    @staticmethod
+    def get_collision_free_env_key(domain: str) -> str:
+        """Generates unambiguous collision-free env key distinguishing dots from hyphens.
+
+        Example:
+            'foo-bar.com' -> 'TRACEPASS_OTP_FOO_DASH_BAR_DOT_COM'
+            'foo.bar.com' -> 'TRACEPASS_OTP_FOO_DOT_BAR_DOT_COM'
+        """
+        clean_domain = domain.strip().lower()
+        if "://" in clean_domain:
+            clean_domain = clean_domain.split("://", 1)[1]
+        clean_domain = clean_domain.split("/", 1)[0]
+        encoded = clean_domain.replace(".", "_DOT_").replace("-", "_DASH_").replace(":", "_PORT_")
+        encoded = re.sub(r"[^a-zA-Z0-9_]", "_", encoded).upper()
+        return f"TRACEPASS_OTP_{encoded}"
+
+    def resolve_otp_code(self, domain: str) -> str | None:
+        """Retrieves OTP code from environment variable or interactive terminal prompt."""
+        # 1. Check collision-free specific env key first
+        collision_free_key = self.get_collision_free_env_key(domain)
+        code = os.environ.get(collision_free_key)
+        if code and code.strip():
+            logger.info("Found OTP code in specific env var %s", collision_free_key)
+            return code.strip()
+
+        # 2. Check standard safe env key
         safe_key = self.normalize_domain_to_env_key(domain)
-        env_var_name = f"TRACEPASS_OTP_{safe_key}"
-        return os.environ.get(env_var_name)
+        standard_key = f"TRACEPASS_OTP_{safe_key}"
+        code = os.environ.get(standard_key)
+        if code and code.strip():
+            logger.info("Found OTP code in standard env var %s", standard_key)
+            return code.strip()
+
+        # 3. Interactive terminal prompt if running locally
+        if self.allow_interactive and sys.stdin and sys.stdin.isatty():
+            try:
+                print(f"\n[Tracepass] Authentication code required for: {domain}")
+                user_code = input("[Tracepass] Enter 6-digit OTP / SMS code: ").strip()
+                if user_code:
+                    return user_code
+            except (EOFError, KeyboardInterrupt):
+                logger.warning("Interactive OTP prompt cancelled by user")
+                return None
+
+        return None
+
+    def verify_page_origin(self, page_url: str | None, target_domain: str) -> None:
+        """Ensures active page origin matches target authentication domain before typing secrets."""
+        if not page_url or page_url in ("about:blank", ""):
+            return
+
+        parsed_page = urlparse(page_url)
+        page_netloc = (parsed_page.netloc or "").split(":")[0].lower()
+        clean_target = target_domain.strip().lower()
+        if "://" in clean_target:
+            clean_target = clean_target.split("://", 1)[1]
+        clean_target = clean_target.split("/", 1)[0].split(":")[0]
+
+        if page_netloc and not (
+            page_netloc == clean_target or page_netloc.endswith(f".{clean_target}")
+        ):
+            logger.warning(
+                "Origin mismatch: active page '%s' does not match target '%s'",
+                page_netloc,
+                clean_target,
+            )
+            raise OTPOriginMismatch(
+                f"Active page origin '{page_netloc}' does not match expected target domain '{clean_target}'"
+            )
 
     async def execute(
         self,
@@ -103,14 +176,19 @@ class OTPPrimaryHandler:
 
         Raises:
             MagicLinkRequired: If the site uses magic link authentication.
-            OTPPrimaryRequired: If no OTP code is found in environment.
+            OTPPrimaryRequired: If no OTP code is provided.
+            OTPOriginMismatch: If active page origin is mismatched.
         """
         if is_magic_link:
             raise MagicLinkRequired(domain)
 
-        otp_code = self.get_env_otp_code(domain)
+        # Validate origin binding before retrieving or typing secret
+        page_url = getattr(page, "url", None)
+        self.verify_page_origin(page_url, domain)
+
+        otp_code = self.resolve_otp_code(domain)
         if not otp_code:
-            logger.warning("No OTP code found in environment for domain: %s", domain)
+            logger.warning("No OTP code provided for domain: %s", domain)
             raise OTPPrimaryRequired(domain)
 
         otp_input_sel = fields.get("otp_input") or self.DEFAULT_OTP_SELECTOR

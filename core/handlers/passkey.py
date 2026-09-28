@@ -2,7 +2,8 @@
 
 Implements Section 2 (Type 9) of docs/login-engine.md:
 - Detects WebAuthn / Passkey prompts.
-- Scans for accessible password / OTP fallback options ('Use password instead', 'Try another way').
+- Scans for accessible password / OTP fallback options ('Use password instead', 'Try another way', 'Use verification code').
+- Inspects accessible names, aria-labels, and inner text.
 - Automatically transitions the page to automatable password-based login.
 - Raises PasskeyRequired only when no automatable fallback exists.
 """
@@ -31,8 +32,15 @@ class PasskeyHandler:
     """Handles Passkey / WebAuthn detection and fallback resolution."""
 
     FALLBACK_REGEX = re.compile(
-        r"(use.*password|try another way|sign in.*differently|use.*different.*method|enter password|other options)",
+        r"(use.*password|try another way|sign in.*differently|use.*different.*method|"
+        r"enter password|other options|verification code|one-time code|send.*code|"
+        r"use.*code|use.*otp|use.*sms|text.*code)",
         re.IGNORECASE,
+    )
+
+    DEFAULT_FALLBACK_INPUTS = (
+        "input[type='password'], input[type='text'], input[type='email'], "
+        "input[autocomplete='one-time-code']"
     )
 
     def __init__(self, timeout_ms: int = 8000) -> None:
@@ -43,13 +51,31 @@ class PasskeyHandler:
         """
         self.timeout_ms = timeout_ms
 
+    async def _wait_for_fallback_transition(self, page: Any) -> None:
+        """Waits for password or OTP input controls to render after clicking fallback."""
+        try:
+            await page.wait_for_selector(
+                self.DEFAULT_FALLBACK_INPUTS,
+                state="visible",
+                timeout=self.timeout_ms,
+            )
+        except Exception:
+            logger.debug(
+                "Fallback input selector not immediately visible within %sms, waiting for network settle",
+                self.timeout_ms,
+            )
+            try:
+                await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+            except Exception:
+                await page.wait_for_timeout(1000)
+
     async def handle_passkey_or_fallback(
         self,
         page: Any,
         domain: str,
         fields: dict[str, str | None] | None = None,
     ) -> bool:
-        """Checks for password fallback option on passkey prompt and clicks it.
+        """Checks for password/OTP fallback option on passkey prompt and clicks it.
 
         Args:
             page: Playwright Page instance.
@@ -64,17 +90,30 @@ class PasskeyHandler:
         """
         explicit_fallback_sel = fields.get("fallback_button") if fields else None
 
+        # 1. Try explicit fallback selector if provided and currently present
         if explicit_fallback_sel:
-            logger.info("Clicking explicit passkey fallback selector: %s", explicit_fallback_sel)
-            fallback_btn = page.locator(explicit_fallback_sel).first
-            await fallback_btn.hover()
-            await fallback_btn.click()
-            await page.wait_for_load_state("domcontentloaded")
-            return True
+            try:
+                explicit_locator = page.locator(explicit_fallback_sel).first
+                if await explicit_locator.count() > 0 and await explicit_locator.is_visible():
+                    logger.info(
+                        "Clicking explicit passkey fallback selector: %s", explicit_fallback_sel
+                    )
+                    await explicit_locator.hover()
+                    await explicit_locator.click()
+                    await self._wait_for_fallback_transition(page)
+                    return True
+                logger.debug(
+                    "Configured explicit fallback '%s' not visible in DOM, scanning page...",
+                    explicit_fallback_sel,
+                )
+            except Exception as e:
+                logger.debug("Explicit fallback check failed (%s), proceeding to scan...", e)
 
-        # Search for fallback links or buttons matching text patterns
-        logger.info("Scanning for visible passkey fallback links/buttons on %s", domain)
-        fallback_candidates = page.locator("a, button, [role='button']")
+        # 2. Scan for fallback links, buttons, or role=button matching text & accessible names
+        logger.info("Scanning for visible passkey fallback controls on %s", domain)
+        fallback_candidates = page.locator(
+            "a, button, [role='button'], input[type='button'], input[type='submit']"
+        )
         count = await fallback_candidates.count()
 
         for i in range(count):
@@ -82,13 +121,26 @@ class PasskeyHandler:
             if not await candidate.is_visible():
                 continue
 
-            text = (await candidate.text_content() or "").strip()
-            if self.FALLBACK_REGEX.search(text):
-                logger.info("Found passkey fallback element with text '%s'; clicking", text)
+            # Check text content, aria-label, title, and value attributes for accessible names
+            text_parts = [
+                await candidate.text_content() or "",
+                await candidate.get_attribute("aria-label") or "",
+                await candidate.get_attribute("title") or "",
+                await candidate.get_attribute("value") or "",
+            ]
+            combined_text = " ".join(t.strip() for t in text_parts if t.strip())
+
+            if self.FALLBACK_REGEX.search(combined_text):
+                logger.info(
+                    "Found passkey fallback element with accessible text '%s'; clicking",
+                    combined_text,
+                )
                 await candidate.hover()
                 await candidate.click()
-                await page.wait_for_load_state("domcontentloaded")
+                await self._wait_for_fallback_transition(page)
                 return True
 
-        logger.warning("No password fallback available on passkey prompt for domain: %s", domain)
+        logger.warning(
+            "No password/OTP fallback available on passkey prompt for domain: %s", domain
+        )
         raise PasskeyRequired(domain)
