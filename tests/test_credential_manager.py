@@ -24,6 +24,7 @@ def test_domain_normalization():
 
 def test_env_injected_credentials(monkeypatch: pytest.MonkeyPatch):
     """Verify credentials resolved from TRACEPASS_CREDS environment variable."""
+    monkeypatch.setattr("core.credential_manager.keyring", None)
     creds_payload = {
         "example.com": {"username": "test_user", "password": "env_password_123"},
         "github.com": {"username": "git_user", "password": "secret_github_token"},
@@ -38,6 +39,23 @@ def test_env_injected_credentials(monkeypatch: pytest.MonkeyPatch):
     assert resolved_git == ("git_user", "secret_github_token")
 
     assert manager.get_credentials("unknown.org") is None
+
+
+def test_malformed_env_injected_credentials(monkeypatch: pytest.MonkeyPatch):
+    """Verify malformed TRACEPASS_CREDS entries are safely skipped."""
+    monkeypatch.setattr("core.credential_manager.keyring", None)
+    # Non-dict top-level JSON, or non-dict values within dict
+    monkeypatch.setenv("TRACEPASS_CREDS", json.dumps(["invalid", "list"]))
+    manager = CredentialManager()
+    assert manager.get_credentials("example.com") is None
+
+    mixed_payload = {
+        "bad.com": "not_a_dict",
+        "good.com": {"username": "u1", "password": "p1"},
+    }
+    monkeypatch.setenv("TRACEPASS_CREDS", json.dumps(mixed_payload))
+    assert manager.get_credentials("good.com") == ("u1", "p1")
+    assert manager.get_credentials("bad.com") is None
 
 
 def test_encrypted_vault_save_and_read(tmp_path: Path):
@@ -106,16 +124,21 @@ def test_encrypted_vault_corrupted_data_raises(tmp_path: Path):
 
 
 def test_encrypted_vault_invalid_format_raises(tmp_path: Path):
-    """Verify InvalidVaultFormat is raised for wrong version, non-hex, or invalid field lengths."""
+    """Verify InvalidVaultFormat is raised for non-dict JSON, wrong version, non-hex, or invalid field lengths."""
     vault_file = tmp_path / "credentials.enc"
     manager = CredentialManager(vault_path=vault_file)
 
-    # 1. Invalid version
+    # 1. Non-dict top-level JSON record
+    vault_file.write_text(json.dumps(["list", "record"]), encoding="utf-8")
+    with pytest.raises(InvalidVaultFormat, match="must be a JSON object"):
+        manager.read_encrypted_vault("any_password")
+
+    # 2. Invalid version
     vault_file.write_text(json.dumps({"version": 2}), encoding="utf-8")
     with pytest.raises(InvalidVaultFormat, match="Unsupported vault version"):
         manager.read_encrypted_vault("any_password")
 
-    # 2. Non-hex fields
+    # 3. Non-hex fields
     vault_file.write_text(
         json.dumps(
             {"version": 1, "salt": "zzz", "nonce": "zzz", "tag": "zzz", "ciphertext": "zzz"}
@@ -125,7 +148,7 @@ def test_encrypted_vault_invalid_format_raises(tmp_path: Path):
     with pytest.raises(InvalidVaultFormat, match="Vault record contains non-hex fields"):
         manager.read_encrypted_vault("any_password")
 
-    # 3. Invalid field lengths (valid hex, but wrong byte counts)
+    # 4. Invalid field lengths (valid hex, but wrong byte counts)
     vault_file.write_text(
         json.dumps(
             {

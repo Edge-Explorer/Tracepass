@@ -106,12 +106,14 @@ class CredentialManager:
         if env_creds_raw:
             try:
                 env_map = json.loads(env_creds_raw)
-                for key, val in env_map.items():
-                    if self.normalize_domain(key) == norm_domain:
-                        user = val.get("username")
-                        pwd = val.get("password")
-                        if user and pwd:
-                            return (user, pwd)
+                if isinstance(env_map, dict):
+                    for key, val in env_map.items():
+                        if isinstance(key, str) and isinstance(val, dict):
+                            if self.normalize_domain(key) == norm_domain:
+                                user = val.get("username")
+                                pwd = val.get("password")
+                                if isinstance(user, str) and isinstance(pwd, str) and user and pwd:
+                                    return (user, pwd)
             except Exception as e:
                 logger.warning("Failed to parse TRACEPASS_CREDS environment variable: %s", e)
 
@@ -121,10 +123,11 @@ class CredentialManager:
                 raw = keyring.get_password(self.KEYRING_SERVICE_NAME, norm_domain)
                 if raw:
                     data = json.loads(raw)
-                    user = data.get("username")
-                    pwd = data.get("password")
-                    if user and pwd:
-                        return (user, pwd)
+                    if isinstance(data, dict):
+                        user = data.get("username")
+                        pwd = data.get("password")
+                        if isinstance(user, str) and isinstance(pwd, str) and user and pwd:
+                            return (user, pwd)
 
         # 4. Encrypted Vault File
         if self.vault_path.is_file() and self.master_password:
@@ -132,7 +135,11 @@ class CredentialManager:
                 vault_data = self.read_encrypted_vault(self.master_password)
                 if norm_domain in vault_data:
                     record = vault_data[norm_domain]
-                    return (record["username"], record["password"])
+                    if isinstance(record, dict):
+                        user = record.get("username")
+                        pwd = record.get("password")
+                        if isinstance(user, str) and isinstance(pwd, str):
+                            return (user, pwd)
             except Exception as e:
                 logger.warning("Error reading encrypted vault for %s: %s", norm_domain, e)
 
@@ -152,6 +159,9 @@ class CredentialManager:
             record = json.loads(self.vault_path.read_text(encoding="utf-8"))
         except Exception as e:
             raise InvalidVaultFormat(f"Vault file {self.vault_path} is not valid JSON") from e
+
+        if not isinstance(record, dict):
+            raise InvalidVaultFormat(f"Vault record in {self.vault_path} must be a JSON object")
 
         if record.get("version") != 1:
             raise InvalidVaultFormat(f"Unsupported vault version: {record.get('version')}")
@@ -182,7 +192,12 @@ class CredentialManager:
         aesgcm = AESGCM(key)
         try:
             decrypted_bytes = aesgcm.decrypt(nonce, ciphertext + tag, None)
-            return json.loads(decrypted_bytes.decode("utf-8"))
+            payload = json.loads(decrypted_bytes.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise InvalidVaultFormat("Decrypted vault payload is not a JSON object")
+            return payload
+        except InvalidVaultFormat:
+            raise
         except Exception as e:
             raise DecryptionError(
                 "Failed to decrypt vault: invalid master password or corrupted tag"
@@ -231,6 +246,10 @@ class CredentialManager:
         }
 
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            with contextlib.suppress(OSError):
+                os.chmod(self.vault_path.parent, 0o700)
+
         temp_file_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
