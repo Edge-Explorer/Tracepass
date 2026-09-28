@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "keyring>=25.7.0",
     "scrapling[all,fetchers]>=0.4.15",
 ]
 
