@@ -21,7 +21,7 @@ class OAuthProviderNotFound(Exception):
 
 
 class OAuthFlowTimeout(Exception):
-    """Raised when the OAuth popup or redirect fails to open/settle within timeout."""
+    """Raised when the OAuth popup or redirect fails to open, close, or settle within timeout."""
 
 
 class OAuthLoginHandler:
@@ -72,21 +72,30 @@ class OAuthLoginHandler:
             bool: True if OAuth flow completed and parent page settled.
 
         Raises:
-            ValueError: If 'sso_button' selector is missing.
+            ValueError: If 'sso_button' selector is missing from fields map.
+            OAuthProviderNotFound: If the SSO button is not found on the page.
             OAuthFlowTimeout: If popup or redirect fails within timeout.
         """
         sso_button_sel = fields.get("sso_button") or fields.get("submit")
         if not sso_button_sel:
             raise ValueError(f"OAuthLoginHandler requires an 'sso_button' selector. Got: {fields}")
 
+        # Verify SSO button is present on the page
+        try:
+            await page.wait_for_selector(
+                sso_button_sel, state="attached", timeout=self.popup_timeout_ms
+            )
+        except Exception as e:
+            raise OAuthProviderNotFound(
+                f"SSO provider button '{sso_button_sel}' not found or failed to render"
+            ) from e
+
         sso_locator = page.locator(sso_button_sel)
 
         if is_popup:
-            logger.info("Arming popup listener and clicking SSO button: %s", sso_button_sel)
+            logger.info("Arming page.expect_popup and clicking SSO button: %s", sso_button_sel)
             try:
-                async with page.context.expect_event(
-                    "page", timeout=self.popup_timeout_ms
-                ) as popup_info:
+                async with page.expect_popup(timeout=self.popup_timeout_ms) as popup_info:
                     await sso_locator.hover()
                     await sso_locator.click()
                 popup_page = await popup_info.value
@@ -109,13 +118,15 @@ class OAuthLoginHandler:
                 )
                 await idp_handler.execute(popup_page, idp_fields)
 
-            # Wait for popup to close automatically upon OAuth completion
+            # Wait for popup to close upon successful authentication
             try:
                 await popup_page.wait_for_event("close", timeout=self.redirect_timeout_ms)
-            except Exception:
-                logger.debug("Popup did not close automatically; closing manually if open")
+            except Exception as e:
                 if not popup_page.is_closed():
                     await popup_page.close()
+                raise OAuthFlowTimeout(
+                    f"OAuth popup did not close within {self.redirect_timeout_ms}ms (authentication may be incomplete)"
+                ) from e
 
             # Wait for original page to settle post-OAuth
             try:
@@ -129,10 +140,9 @@ class OAuthLoginHandler:
         # Redirect mode (same-tab)
         logger.info("Executing same-tab OAuth redirect flow on button: %s", sso_button_sel)
         try:
-            nav_waiter = page.wait_for_navigation(timeout=self.redirect_timeout_ms)
-            await sso_locator.hover()
-            await sso_locator.click()
-            await nav_waiter
+            async with page.expect_navigation(timeout=self.redirect_timeout_ms):
+                await sso_locator.hover()
+                await sso_locator.click()
         except Exception as e:
             raise OAuthFlowTimeout(
                 f"OAuth redirect failed to navigate within {self.redirect_timeout_ms}ms"
@@ -147,7 +157,14 @@ class OAuthLoginHandler:
                 typing_delay_ms=self.typing_delay_ms,
                 timeout_ms=self.timeout_ms,
             )
-            await idp_handler.execute(page, idp_fields)
+            # Expect callback redirect back to application after IdP submit
+            try:
+                async with page.expect_navigation(timeout=self.redirect_timeout_ms):
+                    await idp_handler.execute(page, idp_fields)
+            except Exception as e:
+                raise OAuthFlowTimeout(
+                    f"OAuth callback redirect back to application failed within {self.redirect_timeout_ms}ms"
+                ) from e
 
         try:
             await page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
