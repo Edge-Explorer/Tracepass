@@ -108,12 +108,15 @@ class CredentialManager:
                 env_map = json.loads(env_creds_raw)
                 if isinstance(env_map, dict):
                     for key, val in env_map.items():
-                        if isinstance(key, str) and isinstance(val, dict):
-                            if self.normalize_domain(key) == norm_domain:
-                                user = val.get("username")
-                                pwd = val.get("password")
-                                if isinstance(user, str) and isinstance(pwd, str) and user and pwd:
-                                    return (user, pwd)
+                        if (
+                            isinstance(key, str)
+                            and isinstance(val, dict)
+                            and self.normalize_domain(key) == norm_domain
+                        ):
+                            user = val.get("username")
+                            pwd = val.get("password")
+                            if isinstance(user, str) and isinstance(pwd, str) and user and pwd:
+                                return (user, pwd)
             except Exception as e:
                 logger.warning("Failed to parse TRACEPASS_CREDS environment variable: %s", e)
 
