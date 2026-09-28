@@ -1,13 +1,16 @@
 """Authentication Verifier (Component E).
 
 Implements Component E of docs/login-engine.md:
-- Provides per-domain registered verification checks.
-- Provides a robust generic fallback heuristic checking DOM state, cookies, storage tokens, and error banners.
-- Distinguishes authenticated sessions from rejected credentials or hanging forms.
+- Provides per-domain registered verification checks supporting both async and sync callable objects.
+- Inspects visible error alerts/banners (ignoring hidden DOM nodes).
+- Verifies explicit logout controls (e.g., 'Log out', 'Sign out') without false positives on generic navigation links.
+- Inspects all candidate elements across the document.
+- Checks domain-relevant authentication cookies and JWT storage tokens.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from collections.abc import Callable
@@ -25,8 +28,13 @@ class AuthVerifier:
         re.IGNORECASE,
     )
 
-    AUTH_SIGNAL_REGEX = re.compile(
-        r"(log\s*out|sign\s*out|my\s+account|dashboard|profile|logged\s+in\s+as)",
+    LOGOUT_CONTROL_REGEX = re.compile(
+        r"^(log\s*out|sign\s*out|logout|signout|disconnect|switch\s+account)$",
+        re.IGNORECASE,
+    )
+
+    AUTH_TOKEN_REGEX = re.compile(
+        r"(auth|token|session|jwt|sid|access_token|user_id|logged_in|credential|id_token)",
         re.IGNORECASE,
     )
 
@@ -75,11 +83,10 @@ class AuthVerifier:
             logger.info("Executing registered verifier for domain: %s", clean_domain)
             verifier_fn = self._domain_verifiers[clean_domain]
             try:
-                import inspect
-
-                if inspect.iscoroutinefunction(verifier_fn):
-                    return bool(await verifier_fn(page))
-                return bool(verifier_fn(page))
+                result = verifier_fn(page)
+                if inspect.isawaitable(result):
+                    result = await result
+                return bool(result)
             except Exception as e:
                 logger.warning("Custom verifier for %s raised exception: %s", clean_domain, e)
                 return False
@@ -95,12 +102,21 @@ class AuthVerifier:
         local_storage: dict[str, Any] | None = None,
     ) -> bool:
         """Applies multi-signal heuristic rules to verify login success."""
-        # Signal A: Check for explicit error banners/text on the page
+        # Signal A: Check for VISIBLE error alerts/banners
         try:
-            body_text = await page.locator("body").text_content(timeout=3000) or ""
-            if self.ERROR_TEXT_REGEX.search(body_text):
-                logger.warning("Generic verifier detected login error banner in page body text")
-                return False
+            error_candidates = page.locator(
+                "[role='alert'], .error, .alert, .error-message, .form-error, .login-error, [aria-live='assertive']"
+            )
+            count = await error_candidates.count()
+            for i in range(count):
+                cand = error_candidates.nth(i)
+                if await cand.is_visible():
+                    cand_text = (await cand.text_content() or "").strip()
+                    if self.ERROR_TEXT_REGEX.search(cand_text):
+                        logger.warning(
+                            "Generic verifier detected visible login error banner: '%s'", cand_text
+                        )
+                        return False
         except Exception:
             pass
 
@@ -120,30 +136,37 @@ class AuthVerifier:
             logger.warning("Generic verifier detected visible password input still present")
             return False
 
-        # Signal C: Check for authenticated keywords (Logout, Account, Profile)
+        # Signal C: Check for explicit, visible logout controls
         try:
-            auth_candidates = page.locator("a, button, [role='button'], nav, header")
+            auth_candidates = page.locator("a, button, [role='button']")
             count = await auth_candidates.count()
-            for i in range(min(count, 30)):
+            for i in range(count):
                 elem = auth_candidates.nth(i)
                 if not await elem.is_visible():
                     continue
                 text = (await elem.text_content() or "").strip()
-                if self.AUTH_SIGNAL_REGEX.search(text):
-                    logger.info("Generic verifier matched auth signal element: '%s'", text)
+                aria_label = (await elem.get_attribute("aria-label") or "").strip()
+                if self.LOGOUT_CONTROL_REGEX.search(text) or self.LOGOUT_CONTROL_REGEX.search(
+                    aria_label
+                ):
+                    logger.info(
+                        "Generic verifier matched explicit logout control: '%s'", text or aria_label
+                    )
                     return True
         except Exception:
             pass
 
-        # Signal D: Check cookie / storage token state
-        has_auth_cookies = bool(cookies and len(cookies) > 0)
-        has_storage_token = bool(local_storage and len(local_storage) > 0)
+        # Signal D: Check for domain-relevant auth cookies or JWT storage tokens
+        has_auth_cookies = any(
+            self.AUTH_TOKEN_REGEX.search(c.get("name", "")) for c in (cookies or [])
+        )
+        has_auth_storage = any(self.AUTH_TOKEN_REGEX.search(k) for k in (local_storage or {}))
 
-        if has_auth_cookies or has_storage_token:
+        if has_auth_cookies or has_auth_storage:
             logger.info(
-                "Generic verifier confirmed session state (cookies: %s, storage: %s)",
+                "Generic verifier confirmed auth state via credentials (auth_cookies: %s, auth_storage: %s)",
                 has_auth_cookies,
-                has_storage_token,
+                has_auth_storage,
             )
             return True
 
