@@ -101,11 +101,19 @@ class AuthVerifier:
         cookies: list[dict[str, Any]] | None = None,
         local_storage: dict[str, Any] | None = None,
     ) -> bool:
-        """Applies multi-signal heuristic rules to verify login success."""
+        """Applies multi-signal heuristic rules to verify login success.
+
+        Signal evaluation order (fail-fast on negative indicators):
+          A. Visible login error banners  → definitely failed (return False)
+          B. Password input still visible → still on login page, not authenticated (return False)
+          C. Explicit logout controls     → authenticated (return True)
+          D. Auth cookies / JWT storage   → authenticated (return True)
+        """
         # Signal A: Check for VISIBLE error alerts/banners
         try:
             error_candidates = page.locator(
-                "[role='alert'], .error, .alert, .error-message, .form-error, .login-error, [aria-live='assertive']"
+                "[role='alert'], .error, .alert, .error-message, .form-error, .login-error, "
+                "[aria-live='assertive'], [class*='errorMessage'], [class*='error-'], [class*='inputError']"
             )
             count = await error_candidates.count()
             for i in range(count):
@@ -121,6 +129,8 @@ class AuthVerifier:
             pass
 
         # Signal B: Check if password input is still visible on the page
+        # If the password box is still visible on screen after submit + settling,
+        # the user has NOT transitioned away from the login form (login was rejected).
         password_still_visible = False
         try:
             pass_inputs = page.locator("input[type='password']")
@@ -133,7 +143,9 @@ class AuthVerifier:
             pass
 
         if password_still_visible:
-            logger.warning("Generic verifier detected visible password input still present")
+            logger.warning(
+                "Generic verifier detected visible password input still present — login was rejected or incomplete"
+            )
             return False
 
         # Signal C: Check for explicit, visible logout controls
@@ -160,11 +172,18 @@ class AuthVerifier:
         has_auth_cookies = any(
             self.AUTH_TOKEN_REGEX.search(c.get("name", "")) for c in (cookies or [])
         )
-        has_auth_storage = any(self.AUTH_TOKEN_REGEX.search(k) for k in (local_storage or {}))
+
+        has_auth_storage = False
+        for k, v in (local_storage or {}).items():
+            if self.AUTH_TOKEN_REGEX.search(k):
+                val_str = str(v).strip()
+                if val_str and val_str not in ('""', "{}", "null", "undefined", "false", "[]"):
+                    has_auth_storage = True
+                    break
 
         if has_auth_cookies or has_auth_storage:
             logger.info(
-                "Generic verifier confirmed auth state via credentials (auth_cookies: %s, auth_storage: %s)",
+                "Generic verifier confirmed auth state via tokens (auth_cookies: %s, auth_storage: %s)",
                 has_auth_cookies,
                 has_auth_storage,
             )
