@@ -144,3 +144,12 @@ class PasskeyHandler:
             "No password/OTP fallback available on passkey prompt for domain: %s", domain
         )
         raise PasskeyRequired(domain)
+
+    async def execute(
+        self,
+        page: Any,
+        domain: str,
+        fields: dict[str, str | None] | None = None,
+    ) -> bool:
+        """Standard handler execute interface for PasskeyHandler."""
+        return await self.handle_passkey_or_fallback(page, domain=domain, fields=fields)
