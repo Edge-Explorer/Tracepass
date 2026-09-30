@@ -104,9 +104,7 @@ def main() -> None:
 
     target_url = args.url
     if not target_url:
-        target_url = input(
-            "Enter target login URL (e.g. https://discord.com/login): "
-        ).strip()
+        target_url = input("Enter target login URL (e.g. https://discord.com/login): ").strip()
         if not target_url:
             print("❌ Target URL is required.")
             sys.exit(1)

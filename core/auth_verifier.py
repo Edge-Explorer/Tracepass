@@ -191,4 +191,3 @@ class AuthVerifier:
 
         logger.warning("Generic verifier could not confirm authenticated state")
         return False
-

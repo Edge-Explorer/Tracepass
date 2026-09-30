@@ -193,7 +193,10 @@ class LoginEngine:
                 if cand_flow != LoginFlowType.NONE:
                     fields_res = candidate_fields
                     flow_type = cand_flow
-                    logger.info("DOM hydrated and login fields detected (%s)", flow_type.name if hasattr(flow_type, "name") else flow_type)
+                    logger.info(
+                        "DOM hydrated and login fields detected (%s)",
+                        flow_type.name if hasattr(flow_type, "name") else flow_type,
+                    )
                     break
 
                 await asyncio.sleep(1)
