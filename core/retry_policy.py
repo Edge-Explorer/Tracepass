@@ -4,6 +4,7 @@ Implements Section 8 & Decision 5 of docs/login-engine.md:
 - Failure-type-specific retry matrix.
 - Conservative defaults to protect against account lockout.
 - Differentiates between transient timeouts (1 retry allowed) and credential/lockout failures (0 retries).
+- Handles external Playwright runtime timeouts and out-of-scope errors safely.
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ from core.handlers.passkey import PasskeyRequired
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+try:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+except ImportError:
+    PlaywrightTimeoutError = None  # Fallback when playwright is mocked in unit tests
 
 
 # --- Exception Hierarchy ---
@@ -161,37 +167,54 @@ class RetryPolicy:
 
         Args:
             max_retries_map: Optional custom mapping of exception types to allowed retry counts.
+                If explicitly passed as {} (empty dict), retries are disabled for all types.
             default_max_retries: Default retry count for unlisted exceptions (default 0).
         """
-        self.max_retries_map = max_retries_map or {
-            PageLoadTimeout: 1,
-            MultiStepTransitionTimeout: 1,
-        }
+        self.max_retries_map = (
+            max_retries_map
+            if max_retries_map is not None
+            else {
+                PageLoadTimeout: 1,
+                MultiStepTransitionTimeout: 1,
+            }
+        )
         self.default_max_retries = default_max_retries
 
     def get_decision(self, exception: BaseException, attempt: int = 1) -> RetryDecision:
         """Evaluates an exception and attempt count against Decision 5 rules.
 
         Args:
-            exception: The caught exception instance.
+            exception: The caught exception instance (internal or Playwright runtime error).
             attempt: Current attempt count (1-indexed). Attempt 1 is the initial run.
 
         Returns:
             RetryDecision: Details on whether to retry, delay duration, and reload behavior.
         """
-        exc_type = type(exception)
-        allowed_retries = self.max_retries_map.get(exc_type, self.default_max_retries)
-        doc_reason = self.DEFAULT_REASON_MAP.get(exc_type, "Abort immediately.")
+        # Treat Playwright's native TimeoutError as PageLoadTimeout
+        is_page_timeout = isinstance(exception, PageLoadTimeout) or (
+            PlaywrightTimeoutError is not None and isinstance(exception, PlaywrightTimeoutError)
+        )
+        is_multistep_timeout = isinstance(exception, MultiStepTransitionTimeout)
+
+        if is_page_timeout:
+            key_type: type[BaseException] = PageLoadTimeout
+        elif is_multistep_timeout:
+            key_type = MultiStepTransitionTimeout
+        else:
+            key_type = type(exception)
+
+        allowed_retries = self.max_retries_map.get(key_type, self.default_max_retries)
+        doc_reason = self.DEFAULT_REASON_MAP.get(key_type, "Abort immediately.")
 
         if attempt > allowed_retries:
             return RetryDecision(
                 should_retry=False,
                 delay_seconds=0.0,
                 reload_from_scratch=False,
-                reason=f"Exceeded max retries ({allowed_retries}) for {exc_type.__name__}. {doc_reason}",
+                reason=f"Exceeded max retries ({allowed_retries}) for {key_type.__name__}. {doc_reason}",
             )
 
-        if exc_type is PageLoadTimeout:
+        if is_page_timeout:
             return RetryDecision(
                 should_retry=True,
                 delay_seconds=3.0,
@@ -199,7 +222,7 @@ class RetryPolicy:
                 reason=doc_reason,
             )
 
-        if exc_type is MultiStepTransitionTimeout:
+        if is_multistep_timeout:
             return RetryDecision(
                 should_retry=True,
                 delay_seconds=0.0,
@@ -207,6 +230,7 @@ class RetryPolicy:
                 reason=doc_reason,
             )
 
+        # Out-of-scope or unhandled exceptions default to no retry
         return RetryDecision(
             should_retry=False,
             delay_seconds=0.0,
