@@ -53,15 +53,15 @@ class ModalLoginHandler:
             ValueError: If username or password selector is missing.
             ModalTriggerTimeout: If the modal dialog fails to appear after clicking the trigger.
         """
-        modal_trigger_sel = fields.get("modal_trigger")
+        modal_trigger_sel = fields.get("modal_trigger") or fields.get("modal-trigger")
         username_sel = fields.get("username")
         password_sel = fields.get("password")
         submit_sel = fields.get("submit")
         container_sel = fields.get("modal_container") or self.DEFAULT_MODAL_CONTAINER
 
-        if not username_sel or not password_sel:
+        if not modal_trigger_sel and (not username_sel or not password_sel):
             raise ValueError(
-                f"ModalLoginHandler requires both username and password selectors. Got: {fields}"
+                f"ModalLoginHandler requires both username and password selectors when no modal trigger is provided. Got: {fields}"
             )
 
         # Step 1: Click modal trigger if present
@@ -84,6 +84,14 @@ class ModalLoginHandler:
 
         # Step 3: Scope locators to the modal container if container is present on page
         modal_locator = page.locator(container_sel).first if modal_trigger_sel else page
+
+        if not username_sel:
+            username_sel = (
+                "input[autocomplete='username'], input[type='text'], input[type='email'], "
+                "input[name*='user']"
+            )
+        if not password_sel:
+            password_sel = "input[type='password'], input[name*='pass']"
 
         logger.info("Filling scoped username field: %s", username_sel)
         user_input = modal_locator.locator(username_sel)
