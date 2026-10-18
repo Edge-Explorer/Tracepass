@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/tracepass-banner.png" alt="Tracepass Banner" width="100%">
+</p>
+
 # Tracepass
 
 **Autonomous Web Scraping and Media Extraction Framework**
