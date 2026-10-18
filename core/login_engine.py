@@ -12,6 +12,7 @@ Implements Section 3 (Architecture) & Section 12 of docs/login-engine.md:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -82,14 +83,26 @@ class LoginEngine:
         page: Any,
         target_url: str,
         master_password: str | None = None,
+        skip_session_cache: bool = False,
     ) -> bool:
-        """Runs the complete 5-stage autonomous login pipeline on a Playwright page."""
+        """Runs the complete 5-stage autonomous login pipeline on a Playwright page.
+
+        Args:
+            page: Playwright page object from Scrapling page_action.
+            target_url: Full URL of the login page.
+            master_password: Optional master password for encrypted credential store.
+            skip_session_cache: If True, bypass Stage 1 session restoration entirely.
+                                 Set this when the caller has explicitly provided credentials
+                                 to test — otherwise the cached session will be reused and
+                                 the provided credentials will never be tried.
+        """
 
         async def _run_pipeline() -> bool:
             domain = self._extract_domain(target_url)
 
             # Stage 1: Session Cache Check & Restoration
-            if self.session_manager.has_valid_session(target_url):
+            # Skipped when the caller explicitly provides credentials to test.
+            if not skip_session_cache and self.session_manager.has_valid_session(target_url):
                 session_data = self.session_manager.load_session(target_url)
                 if session_data:
                     logger.info("Restoring cached session state for %s", domain)
@@ -147,19 +160,51 @@ class LoginEngine:
             username, password = creds
 
             # Stage 3: DOM Flow Analysis
-            # For SPAs (React/Vue/Angular), wait for visible input elements to render into the DOM
-            try:
-                await page.wait_for_selector(
-                    "input[name='email'], input[name='username'], input[type='password'], input",
-                    state="visible",
-                    timeout=15000,
-                )
-            except Exception:
-                logger.debug("No input elements visible within initial wait timeout")
+            # Robust polling loop for SPAs (React/Vue/Angular/Discord) to hydrate the DOM.
+            # Instead of a fixed sleep, we poll for up to 15 seconds until FieldDetector finds the fields.
+            fields_res = None
+            flow_type = LoginFlowType.NONE
+            poll_start = asyncio.get_event_loop().time()
+            max_poll_seconds = 15
 
-            html_content = await page.content()
-            adaptor = Adaptor(html_content)
-            fields_res = self.field_detector.detect_fields(adaptor)
+            while (asyncio.get_event_loop().time() - poll_start) < max_poll_seconds:
+                # 1. Try wait_for_selector with login-specific elements
+                try:
+                    await page.wait_for_selector(
+                        "input[name='email'], input[name='username'], input[name='password'], "
+                        "input[type='password'], input[autocomplete='email'], "
+                        "input[autocomplete='username']",
+                        state="visible",
+                        timeout=2000,
+                    )
+                except Exception as e:
+                    logger.debug("wait_for_selector polling: %s", e)
+
+                # 2. Check if FieldDetector can detect fields from the current DOM
+                html_content = await page.content()
+                adaptor = Adaptor(html_content)
+                candidate_fields = self.field_detector.detect_fields(adaptor)
+
+                if isinstance(candidate_fields, dict) and "flow_type" in candidate_fields:
+                    cand_flow = candidate_fields["flow_type"]
+                else:
+                    cand_flow = self.field_detector.classify_flow(candidate_fields)
+
+                if cand_flow != LoginFlowType.NONE:
+                    fields_res = candidate_fields
+                    flow_type = cand_flow
+                    logger.info(
+                        "DOM hydrated and login fields detected (%s)",
+                        flow_type.name if hasattr(flow_type, "name") else flow_type,
+                    )
+                    break
+
+                await asyncio.sleep(1)
+
+            if fields_res is None or flow_type == LoginFlowType.NONE:
+                html_content = await page.content()
+                adaptor = Adaptor(html_content)
+                fields_res = self.field_detector.detect_fields(adaptor)
 
             if (
                 isinstance(fields_res, dict)

@@ -83,18 +83,37 @@ class CredentialManager:
         norm_domain = self.normalize_domain(domain)
         self._memory_cache[norm_domain] = (username, password)
 
+    @staticmethod
+    def _load_env_file() -> None:
+        """Parses local .env file into os.environ if present."""
+        env_path = Path(".env")
+        if env_path.is_file():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip("'").strip('"')
+                    if key and key not in os.environ:
+                        os.environ[key] = val
+            except Exception as e:
+                logger.debug("Error reading .env file: %s", e)
+
     def get_credentials(self, domain_or_url: str) -> tuple[str, str] | None:
         """Resolves username and password for a domain across all configured sources.
 
         Priority order:
         1. In-process memory cache.
-        2. TRACEPASS_CREDS environment variable (JSON map).
+        2. TRACEPASS_CREDS environment variable (JSON map) or env fallbacks.
         3. OS Keyring (if available).
         4. Encrypted vault file (~/.tracepass/credentials.enc).
 
         Returns:
             tuple[str, str] | None: (username, password) or None if not found.
         """
+        self._load_env_file()
         norm_domain = self.normalize_domain(domain_or_url)
 
         # 1. In-process memory cache
@@ -119,6 +138,12 @@ class CredentialManager:
                                 return (user, pwd)
             except Exception as e:
                 logger.warning("Failed to parse TRACEPASS_CREDS environment variable: %s", e)
+
+        # Fallback environment keys: TRACEPASS_USERNAME / TRACEPASS_PASSWORD
+        env_user = os.environ.get("TRACEPASS_USERNAME")
+        env_pass = os.environ.get("TRACEPASS_PASSWORD")
+        if env_user and env_pass and env_user.strip() and env_pass.strip():
+            return (env_user.strip(), env_pass.strip())
 
         # 3. OS Keyring
         if keyring is not None:

@@ -237,10 +237,21 @@ class FieldDetector:
 
     @classmethod
     def detect_modal_trigger(cls, response: Any) -> str | None:
-        """Detects a modal or overlay trigger button."""
-        triggers = response.css("button, a, div[role='button']")
+        """Detects a modal or overlay trigger button (ignoring navigation hyperlinks)."""
+        triggers = response.css("button, div[role='button'], a")
         for trigger in triggers:
             if not cls.is_honeypot(trigger):
+                # Ignore navigation hyperlinks (<a> tags with page navigation hrefs)
+                tag = getattr(trigger, "tag", "").lower()
+                href = trigger.attrib.get("href", "").strip()
+                if (
+                    tag == "a"
+                    and href
+                    and not href.startswith("#")
+                    and not href.startswith("javascript:")
+                ):
+                    continue
+
                 text = cls._get_text(trigger)
                 aria_haspopup = trigger.attrib.get("aria-haspopup", "").lower()
                 if aria_haspopup == "dialog" or cls.MODAL_TRIGGER_RE.search(text):
